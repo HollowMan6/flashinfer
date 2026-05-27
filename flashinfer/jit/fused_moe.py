@@ -124,6 +124,15 @@ def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
     return gen_cutlass_fused_moe_module(nvcc_flags, "90", use_fast_build)
 
 
+def gen_cutlass_fused_moe_sm80_module(use_fast_build: bool = False) -> JitSpec:
+    nvcc_flags = [
+        "-gencode=arch=compute_80,code=sm_80",
+        "-DENABLE_BF16",
+        "-DUSING_OSS_CUTLASS_MOE_GEMM",
+    ]
+    return gen_cutlass_fused_moe_module(nvcc_flags, "80", use_fast_build)
+
+
 def gen_cutlass_fused_moe_sm89_module(use_fast_build: bool = False) -> JitSpec:
     nvcc_flags = sm89_nvcc_flags + [
         "-DENABLE_BF16",
@@ -214,6 +223,8 @@ def gen_cutlass_fused_moe_module(
             / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp",
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/lora/lora.cpp",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal/tensorrt_llm/kernels/lora/lora_kernels.cu",
         ],
         extra_cuda_cflags=nvcc_flags,
         extra_cflags=["-DFAST_BUILD"] if use_fast_build else [],

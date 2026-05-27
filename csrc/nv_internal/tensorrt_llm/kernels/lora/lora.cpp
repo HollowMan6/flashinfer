@@ -17,15 +17,5 @@
 
 #include "tensorrt_llm/kernels/lora/lora.h"
 
-#include <algorithm>
-#include <utility>
-
-namespace tensorrt_llm::kernels {
-
-int Lora_run(LoraImpl* impl, int64_t numTokens, int64_t numReqs, void const* input,
-             int32_t const* loraRanks, void const* const* loraWeightsPtr, int weightIndex,
-             void* const* outputs, void* workspace, cudaStream_t stream) {
-  return -1;
-}
-
-}  // namespace tensorrt_llm::kernels
+// The CUDA implementation lives in lora_kernels.cu. Keep this translation unit
+// so existing JIT source lists that reference lora.cpp continue to resolve.

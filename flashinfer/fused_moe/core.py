@@ -51,6 +51,7 @@ from ..jit.fused_moe import (
     gen_cutlass_fused_moe_sm103_module,
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm90_module,
+    gen_cutlass_fused_moe_sm80_module,
     gen_cutlass_fused_moe_sm89_module,
     gen_trtllm_gen_fused_moe_sm100_module,
 )
@@ -245,6 +246,8 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         module = gen_cutlass_fused_moe_sm100_module(use_fast_build).build_and_load()
     elif backend == "90":
         module = gen_cutlass_fused_moe_sm90_module(use_fast_build).build_and_load()
+    elif backend == "80":
+        module = gen_cutlass_fused_moe_sm80_module(use_fast_build).build_and_load()
     elif backend == "89":
         module = gen_cutlass_fused_moe_sm89_module(use_fast_build).build_and_load()
     else:
@@ -477,6 +480,14 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         enable_pdl: Optional[bool] = None,
         activation_type: ActivationType = ActivationType.Swiglu,
         use_packed_weights: bool = False,
+        token_lora_indices: Optional[torch.Tensor] = None,
+        fc1_lora_ranks: Optional[torch.Tensor] = None,
+        fc1_lora_weight_ptrs: Optional[torch.Tensor] = None,
+        fc2_lora_ranks: Optional[torch.Tensor] = None,
+        fc2_lora_weight_ptrs: Optional[torch.Tensor] = None,
+        gated_lora_ranks: Optional[torch.Tensor] = None,
+        gated_lora_weight_ptrs: Optional[torch.Tensor] = None,
+        lora_max_rank: int = 0,
     ) -> List[torch.Tensor]:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
@@ -590,6 +601,14 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             min_latency_mode,
             [gemm_tactic_1, gemm_tactic_2],
             enable_pdl,
+            token_lora_indices,
+            fc1_lora_ranks,
+            fc1_lora_weight_ptrs,
+            fc2_lora_ranks,
+            fc2_lora_weight_ptrs,
+            gated_lora_ranks,
+            gated_lora_weight_ptrs,
+            lora_max_rank,
             activation_type,
         )
 
@@ -634,7 +653,16 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         min_latency_mode: bool = False,
         tune_max_num_tokens: int = 8192,
         enable_pdl: Optional[bool] = None,
+        activation_type: ActivationType = ActivationType.Swiglu,
         use_packed_weights: bool = False,
+        token_lora_indices: Optional[torch.Tensor] = None,
+        fc1_lora_ranks: Optional[torch.Tensor] = None,
+        fc1_lora_weight_ptrs: Optional[torch.Tensor] = None,
+        fc2_lora_ranks: Optional[torch.Tensor] = None,
+        fc2_lora_weight_ptrs: Optional[torch.Tensor] = None,
+        gated_lora_ranks: Optional[torch.Tensor] = None,
+        gated_lora_weight_ptrs: Optional[torch.Tensor] = None,
+        lora_max_rank: int = 0,
     ):
         seq_len = input.shape[0]
         hidden_size = fc2_expert_weights.shape[1]
@@ -805,6 +833,14 @@ def cutlass_fused_moe(
     enable_pdl: Optional[bool] = None,
     activation_type: ActivationType = ActivationType.Swiglu,
     swizzled_input_sf: bool = True,
+    token_lora_indices: Optional[torch.Tensor] = None,
+    fc1_lora_ranks: Optional[torch.Tensor] = None,
+    fc1_lora_weight_ptrs: Optional[torch.Tensor] = None,
+    fc2_lora_ranks: Optional[torch.Tensor] = None,
+    fc2_lora_weight_ptrs: Optional[torch.Tensor] = None,
+    gated_lora_ranks: Optional[torch.Tensor] = None,
+    gated_lora_weight_ptrs: Optional[torch.Tensor] = None,
+    lora_max_rank: int = 0,
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
 
@@ -921,6 +957,22 @@ def cutlass_fused_moe(
         communication where the scaling factors are received in linear (non-swizzled) format.
         Only relevant when input_sf is not None.
 
+    token_lora_indices : Optional[torch.Tensor]
+        CUDA int32/int64 tensor with one LoRA adapter index per input token. ``-1`` means
+        no LoRA for that token.
+
+    fc1_lora_ranks, fc2_lora_ranks, gated_lora_ranks : Optional[torch.Tensor]
+        CUDA int32 tensors with one math LoRA rank per adapter. The rank can be smaller than
+        ``lora_max_rank`` for padded storage. Gated activations require ``gated_lora_ranks``.
+
+    fc1_lora_weight_ptrs, fc2_lora_weight_ptrs, gated_lora_weight_ptrs : Optional[torch.Tensor]
+        CUDA int64/uint64 tensors containing ``[A, B]`` device pointers per adapter. The
+        pointed weights are expected in expert-major LoRA layout padded to ``lora_max_rank``
+        and are offset by the selected expert inside the kernel.
+
+    lora_max_rank : int = 0
+        Maximum LoRA storage rank used to compute expert strides.
+
     Returns
     -------
     out: torch.Tensor
@@ -932,6 +984,8 @@ def cutlass_fused_moe(
     NotImplementedError:
         If any of the following features are requested but not implemented:
             - Minimum Latency Mode
+            - LoRA with Minimum Latency Mode
+            - LoRA with expert parallelism or all-to-all
 
     Note
     ----
@@ -942,6 +996,29 @@ def cutlass_fused_moe(
     """
     major, minor = torch.cuda.get_device_capability()
     device_arch = f"{major * 10 + minor}"
+
+    has_lora_args = any(
+        arg is not None
+        for arg in (
+            token_lora_indices,
+            fc1_lora_ranks,
+            fc1_lora_weight_ptrs,
+            fc2_lora_ranks,
+            fc2_lora_weight_ptrs,
+            gated_lora_ranks,
+            gated_lora_weight_ptrs,
+        )
+    )
+    if has_lora_args:
+        if min_latency_mode:
+            raise NotImplementedError(
+                "CUTLASS MoE LoRA does not support min latency mode."
+            )
+        if ep_size != 1 or ep_rank != 0 or enable_alltoall:
+            raise NotImplementedError(
+                "CUTLASS MoE LoRA does not support expert parallelism or "
+                "all-to-all yet."
+            )
 
     if min_latency_mode:
         raise NotImplementedError("min latency mode not yet implemented for Blackwell.")
@@ -1003,6 +1080,14 @@ def cutlass_fused_moe(
         tune_max_num_tokens=tune_max_num_tokens,
         enable_pdl=enable_pdl,
         activation_type=activation_type,
+        token_lora_indices=token_lora_indices,
+        fc1_lora_ranks=fc1_lora_ranks,
+        fc1_lora_weight_ptrs=fc1_lora_weight_ptrs,
+        fc2_lora_ranks=fc2_lora_ranks,
+        fc2_lora_weight_ptrs=fc2_lora_weight_ptrs,
+        gated_lora_ranks=gated_lora_ranks,
+        gated_lora_weight_ptrs=gated_lora_weight_ptrs,
+        lora_max_rank=lora_max_rank,
     )
 
 

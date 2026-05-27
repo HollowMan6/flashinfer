@@ -27,6 +27,7 @@ class TrtLlm_EpilogueTag(enum.Enum):
     epilogue_op_bias = enum_auto()
     epilogue_op_silu = enum_auto()
     epilogue_op_gelu = enum_auto()
+    epilogue_op_relu2 = enum_auto()
 
 
 class TrtLlm_EpilogueFusion(enum.Enum):
@@ -39,6 +40,7 @@ EpiTagNames = {
     TrtLlm_EpilogueTag.epilogue_op_bias: "lc_bias",  # linear combination with bias addition
     TrtLlm_EpilogueTag.epilogue_op_silu: "silu",  # silu or swiglu
     TrtLlm_EpilogueTag.epilogue_op_gelu: "gelu",  # gelu or geglu
+    TrtLlm_EpilogueTag.epilogue_op_relu2: "relu2",
 }
 
 EpiTag = {
@@ -46,6 +48,7 @@ EpiTag = {
     TrtLlm_EpilogueTag.epilogue_op_bias: "tensorrt_llm::cutlass_extensions::EpilogueOpBias",
     TrtLlm_EpilogueTag.epilogue_op_silu: "tensorrt_llm::cutlass_extensions::EpilogueOpDefaultSilu",
     TrtLlm_EpilogueTag.epilogue_op_gelu: "tensorrt_llm::cutlass_extensions::EpilogueOpDefaultFtGelu",
+    TrtLlm_EpilogueTag.epilogue_op_relu2: "tensorrt_llm::cutlass_extensions::EpilogueOpDefaultRelu2",
 }
 
 EpiFusion = {
@@ -990,6 +993,7 @@ def generate_sm80_fused_grouped_gemm_operations():
     epi_tags = [
         TrtLlm_EpilogueTag.epilogue_op_silu,
         TrtLlm_EpilogueTag.epilogue_op_gelu,
+        TrtLlm_EpilogueTag.epilogue_op_relu2,
     ]
     cta_shapes_mnk = [
         (16, 128, 64),

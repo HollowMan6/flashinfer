@@ -18,6 +18,8 @@
 #pragma once
 
 #include <cassert>
+#include <memory>
+#include <optional>
 #include <vector>
 
 #include "tensorrt_llm/common/NvInferRuntime.h"
@@ -31,16 +33,23 @@ using Config = cublasLtMatmulHeuristicResult_t;
 
 class LoraImpl {
  public:
+  // max_low_rank is the padded storage rank used for A/B strides and workspace size.
   LoraImpl(int in_hidden_size, std::vector<int> out_hidden_sizes, bool transA, bool transB,
            int num_lora_modules, nvinfer1::DataType type, int max_low_rank,
            std::shared_ptr<CublasGemmWrapper> cublasWrapper);
 
   [[nodiscard]] size_t getWorkspaceSize(int64_t numTokens, int64_t numReqs,
                                         nvinfer1::DataType type) const noexcept;
+  [[nodiscard]] size_t getDeviceWorkspaceSize(int64_t numTokens, int64_t numReqs,
+                                              nvinfer1::DataType type) const noexcept;
   void setBestTactic(std::optional<Config> config);
+  // loraRanks are math ranks. Weight storage is padded to the constructor max_low_rank.
   int run(int64_t numTokens, int64_t numReqs, void const* input, int32_t const* loraRanks,
           void const* const* loraWeightsPtr, int weightIndex, void* const* outputs, void* workspace,
           cudaStream_t stream);
+  int runDevice(int64_t numTokens, int64_t numReqs, void const* input, int32_t const* loraRanks,
+                void const* const* loraWeightsPtr, int weightIndex, void* const* outputs,
+                void* workspace, cudaStream_t stream);
 
   void setGemmConfig();
 
@@ -68,5 +77,9 @@ class LoraImpl {
 int Lora_run(LoraImpl* impl, int64_t numTokens, int64_t numReqs, void const* input,
              int32_t const* loraRanks, void const* const* loraWeightsPtr, int weightIndex,
              void* const* outputs, void* workspace, cudaStream_t stream);
+
+int Lora_run_device(LoraImpl* impl, int64_t numTokens, int64_t numReqs, void const* input,
+                    int32_t const* loraRanks, void const* const* loraWeightsPtr, int weightIndex,
+                    void* const* outputs, void* workspace, cudaStream_t stream);
 
 }  // namespace tensorrt_llm::kernels

@@ -43,9 +43,14 @@ int Lora_run(LoraImpl* impl, int64_t numTokens, int64_t numReqs, void const* inp
              int32_t const* loraRanks, void const* const* loraWeightsPtr, int weightIndex,
              void* const* outputs, void* workspace, cudaStream_t stream);
 
+int Lora_run_device(LoraImpl* impl, int64_t numTokens, int64_t numReqs, void const* input,
+                    int32_t const* loraRanks, void const* const* loraWeightsPtr, int weightIndex,
+                    void* const* outputs, void* workspace, cudaStream_t stream);
+
 struct LoraParams {
   using LoraImplPtr = std::shared_ptr<LoraImpl>;
 
+  // Rank tensors hold math ranks. LoRA weight storage remains padded to max_low_rank.
   int32_t const* fc1_lora_ranks = nullptr;
   void const* const* fc1_lora_weight_ptrs = nullptr;
 
@@ -55,23 +60,38 @@ struct LoraParams {
   int32_t const* gated_lora_ranks = nullptr;
   void const* const* gated_lora_weight_ptrs = nullptr;
 
+  void const* token_lora_indices = nullptr;
+  bool token_lora_indices_is_int64 = false;
+  int num_lora_adapters = 0;
+  int max_low_rank = 0;
+
+  int32_t* permuted_fc1_lora_ranks = nullptr;
+  void const** permuted_fc1_lora_weight_ptrs = nullptr;
+
+  int32_t* permuted_fc2_lora_ranks = nullptr;
+  void const** permuted_fc2_lora_weight_ptrs = nullptr;
+
+  int32_t* permuted_gated_lora_ranks = nullptr;
+  void const** permuted_gated_lora_weight_ptrs = nullptr;
+
   // used to calculate split group gemm workspace
-  int num_reqs;
+  int num_reqs = 0;
 
   // fc1 and gated use the same impl
   LoraImplPtr fc1_lora_impl;
   LoraImplPtr fc2_lora_impl;
 
-  void* workspace;
-
-  cudaEvent_t* memcpy_event_ptr;
+  void* workspace = nullptr;
+  void* metadata_workspace = nullptr;
 
   LoraParams() = default;
 
   LoraParams(int num_reqs, int32_t const* fc1_lora_ranks, void const* const* fc1_lora_weight_ptrs,
              int32_t const* fc2_lora_ranks, void const* const* fc2_lora_weight_ptrs,
              LoraImplPtr fc1_lora_impl, LoraImplPtr fc2_lora_impl, void* workspace,
-             cudaEvent_t* memcpy_event_ptr, int32_t const* gated_lora_ranks = nullptr,
+             void* metadata_workspace, void const* token_lora_indices,
+             bool token_lora_indices_is_int64, int num_lora_adapters, int max_low_rank,
+             int32_t const* gated_lora_ranks = nullptr,
              void const* const* gated_lora_weight_ptrs = nullptr)
       : fc1_lora_ranks(fc1_lora_ranks),
         fc1_lora_weight_ptrs(fc1_lora_weight_ptrs),
@@ -79,11 +99,15 @@ struct LoraParams {
         fc2_lora_weight_ptrs(fc2_lora_weight_ptrs),
         gated_lora_ranks(gated_lora_ranks),
         gated_lora_weight_ptrs(gated_lora_weight_ptrs),
+        token_lora_indices(token_lora_indices),
+        token_lora_indices_is_int64(token_lora_indices_is_int64),
+        num_lora_adapters(num_lora_adapters),
+        max_low_rank(max_low_rank),
         num_reqs(num_reqs),
         fc1_lora_impl(fc1_lora_impl),
         fc2_lora_impl(fc2_lora_impl),
         workspace(workspace),
-        memcpy_event_ptr(memcpy_event_ptr) {}
+        metadata_workspace(metadata_workspace) {}
 };
 
 namespace cutlass_kernels {
@@ -986,19 +1010,6 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 
   TmaWarpSpecializedGroupedGemmInput tma_ws_grouped_gemm1_input_;
   TmaWarpSpecializedGroupedGemmInput tma_ws_grouped_gemm2_input_;
-
-  struct HostLoraWorkspace {
-    std::vector<int> host_permuted_rows;
-    std::vector<void const*> host_permuted_fc1_weight_ptrs;
-    std::vector<void const*> host_permuted_fc2_weight_ptrs;
-    std::vector<void const*> host_permuted_gated_weight_ptrs;
-    std::vector<int32_t> host_permuted_fc1_lora_ranks;
-    std::vector<int32_t> host_permuted_fc2_lora_ranks;
-    std::vector<int32_t> host_permuted_gated_lora_ranks;
-    std::vector<int64_t> host_expert_first_token_offset;
-  };
-
-  HostLoraWorkspace host_lora_workspace_;
 };
 
 struct GemmProfilerBackend {

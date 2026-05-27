@@ -3362,6 +3362,88 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
   sync_check_cuda_error(stream);
 }
 
+inline size_t loraMetadataAlign16(size_t value) { return ((value + 15) / 16) * 16; }
+
+inline char* advanceLoraMetadataWorkspace(char*& ptr, size_t size) {
+  char* out = ptr;
+  ptr += loraMetadataAlign16(size);
+  return out;
+}
+
+template <typename ScaleBiasType, typename TokenIndexT>
+__global__ void prepareLoraMetadataKernel(
+    int64_t expanded_num_rows, int64_t num_rows, int64_t a_expert_stride, int64_t b_expert_stride,
+    int num_lora_adapters, int max_low_rank, int64_t const* expert_first_token_offset,
+    int const* permuted_row_to_unpermuted_row, TokenIndexT const* token_lora_indices,
+    int32_t const* adapter_lora_ranks, void const* const* adapter_lora_weight_ptrs,
+    int32_t* permuted_lora_ranks, void const** permuted_lora_weight_ptrs) {
+  int const expert_idx = blockIdx.x;
+  int64_t const begin = expert_first_token_offset[expert_idx];
+  int64_t const end = expert_first_token_offset[expert_idx + 1];
+
+  for (int64_t row = begin + threadIdx.x; row < end; row += blockDim.x) {
+    if (row >= expanded_num_rows) {
+      continue;
+    }
+    int const source_index = permuted_row_to_unpermuted_row[row] % num_rows;
+    int64_t const lora_idx = static_cast<int64_t>(token_lora_indices[source_index]);
+    if (lora_idx < 0 || lora_idx >= num_lora_adapters) {
+      permuted_lora_ranks[row] = 0;
+      continue;
+    }
+
+    int32_t lora_rank = adapter_lora_ranks[lora_idx];
+    if (lora_rank <= 0) {
+      permuted_lora_ranks[row] = 0;
+      continue;
+    }
+    if (lora_rank > max_low_rank) {
+      lora_rank = max_low_rank;
+    }
+
+    auto const* lora_a =
+        reinterpret_cast<ScaleBiasType const*>(adapter_lora_weight_ptrs[lora_idx * 2]);
+    auto const* lora_b =
+        reinterpret_cast<ScaleBiasType const*>(adapter_lora_weight_ptrs[lora_idx * 2 + 1]);
+    if (lora_a == nullptr || lora_b == nullptr) {
+      permuted_lora_ranks[row] = 0;
+      continue;
+    }
+
+    permuted_lora_ranks[row] = lora_rank;
+    permuted_lora_weight_ptrs[row * 2] =
+        lora_a + static_cast<size_t>(expert_idx) * static_cast<size_t>(a_expert_stride);
+    permuted_lora_weight_ptrs[row * 2 + 1] =
+        lora_b + static_cast<size_t>(expert_idx) * static_cast<size_t>(b_expert_stride);
+  }
+}
+
+template <typename ScaleBiasType>
+void prepareLoraMetadata(int64_t expanded_num_rows, int64_t num_rows, int64_t a_expert_stride,
+                         int64_t b_expert_stride, int num_lora_adapters, int max_low_rank,
+                         int num_experts_per_node, int64_t const* expert_first_token_offset,
+                         int const* permuted_row_to_unpermuted_row, void const* token_lora_indices,
+                         bool token_lora_indices_is_int64, int32_t const* adapter_lora_ranks,
+                         void const* const* adapter_lora_weight_ptrs, int32_t* permuted_lora_ranks,
+                         void const** permuted_lora_weight_ptrs, cudaStream_t stream) {
+  TLLM_CUDA_CHECK(
+      cudaMemsetAsync(permuted_lora_ranks, 0, expanded_num_rows * sizeof(int32_t), stream));
+  constexpr int threads = 256;
+  if (token_lora_indices_is_int64) {
+    prepareLoraMetadataKernel<ScaleBiasType, int64_t><<<num_experts_per_node, threads, 0, stream>>>(
+        expanded_num_rows, num_rows, a_expert_stride, b_expert_stride, num_lora_adapters,
+        max_low_rank, expert_first_token_offset, permuted_row_to_unpermuted_row,
+        static_cast<int64_t const*>(token_lora_indices), adapter_lora_ranks,
+        adapter_lora_weight_ptrs, permuted_lora_ranks, permuted_lora_weight_ptrs);
+  } else {
+    prepareLoraMetadataKernel<ScaleBiasType, int32_t><<<num_experts_per_node, threads, 0, stream>>>(
+        expanded_num_rows, num_rows, a_expert_stride, b_expert_stride, num_lora_adapters,
+        max_low_rank, expert_first_token_offset, permuted_row_to_unpermuted_row,
+        static_cast<int32_t const*>(token_lora_indices), adapter_lora_ranks,
+        adapter_lora_weight_ptrs, permuted_lora_ranks, permuted_lora_weight_ptrs);
+  }
+}
+
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
           bool IsMXFPX, class Enable>
 bool CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
@@ -3370,90 +3452,65 @@ bool CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
                                                     int start_expert, bool is_gated_activation,
                                                     int num_experts_per_node, bool needs_num_valid,
                                                     LoraParams& lora_params, cudaStream_t stream) {
-  std::vector<int>& host_permuted_rows = host_lora_workspace_.host_permuted_rows;
-  std::vector<void const*>& host_permuted_fc1_weight_ptrs =
-      host_lora_workspace_.host_permuted_fc1_weight_ptrs;
-  std::vector<void const*>& host_permuted_fc2_weight_ptrs =
-      host_lora_workspace_.host_permuted_fc2_weight_ptrs;
-  std::vector<void const*>& host_permuted_gated_weight_ptrs =
-      host_lora_workspace_.host_permuted_gated_weight_ptrs;
+  TLLM_CHECK_WITH_INFO(!needs_num_valid && start_expert == 0,
+                       "LoRA metadata setup does not support expert parallelism yet");
+  TLLM_CHECK_WITH_INFO(lora_params.metadata_workspace != nullptr,
+                       "LoRA metadata workspace must not be null");
+  TLLM_CHECK_WITH_INFO(lora_params.token_lora_indices != nullptr,
+                       "LoRA token mapping must not be null");
+  TLLM_CHECK_WITH_INFO(lora_params.max_low_rank > 0, "LoRA max rank must be positive");
+  TLLM_CHECK_WITH_INFO(lora_params.num_lora_adapters > 0, "LoRA adapter count must be positive");
 
-  std::vector<int32_t>& host_permuted_fc1_lora_ranks =
-      host_lora_workspace_.host_permuted_fc1_lora_ranks;
-  std::vector<int32_t>& host_permuted_fc2_lora_ranks =
-      host_lora_workspace_.host_permuted_fc2_lora_ranks;
-  std::vector<int32_t>& host_permuted_gated_lora_ranks =
-      host_lora_workspace_.host_permuted_gated_lora_ranks;
-  std::vector<int64_t>& host_expert_first_token_offset =
-      host_lora_workspace_.host_expert_first_token_offset;
+  char* metadata_ptr = static_cast<char*>(lora_params.metadata_workspace);
+  auto allocateRanks = [&]() {
+    return reinterpret_cast<int32_t*>(
+        advanceLoraMetadataWorkspace(metadata_ptr, expanded_num_rows * sizeof(int32_t)));
+  };
+  auto allocatePtrs = [&]() {
+    return reinterpret_cast<void const**>(
+        advanceLoraMetadataWorkspace(metadata_ptr, expanded_num_rows * 2 * sizeof(void const*)));
+  };
 
-  bool all_token_without_lora = true;
+  lora_params.permuted_fc1_lora_ranks = allocateRanks();
+  lora_params.permuted_fc1_lora_weight_ptrs = allocatePtrs();
+  lora_params.permuted_fc2_lora_ranks = allocateRanks();
+  lora_params.permuted_fc2_lora_weight_ptrs = allocatePtrs();
+  if (is_gated_activation) {
+    lora_params.permuted_gated_lora_ranks = allocateRanks();
+    lora_params.permuted_gated_lora_weight_ptrs = allocatePtrs();
+  }
 
-  host_permuted_fc1_weight_ptrs.resize(expanded_num_rows * 2);
-  host_permuted_fc1_lora_ranks.resize(expanded_num_rows);
-  host_permuted_fc2_weight_ptrs.resize(expanded_num_rows * 2);
-  host_permuted_fc2_lora_ranks.resize(expanded_num_rows);
+  int64_t const fc1_a_expert_stride = hidden_size * lora_params.max_low_rank;
+  int64_t const fc1_b_expert_stride = inter_size * lora_params.max_low_rank;
+  int64_t const fc2_a_expert_stride = inter_size * lora_params.max_low_rank;
+  int64_t const fc2_b_expert_stride = hidden_size * lora_params.max_low_rank;
+
+  prepareLoraMetadata<ScaleBiasType>(
+      expanded_num_rows, num_rows, fc1_a_expert_stride, fc1_b_expert_stride,
+      lora_params.num_lora_adapters, lora_params.max_low_rank, num_experts_per_node,
+      expert_first_token_offset_, permuted_row_to_unpermuted_row_, lora_params.token_lora_indices,
+      lora_params.token_lora_indices_is_int64, lora_params.fc1_lora_ranks,
+      lora_params.fc1_lora_weight_ptrs, lora_params.permuted_fc1_lora_ranks,
+      lora_params.permuted_fc1_lora_weight_ptrs, stream);
+  prepareLoraMetadata<ScaleBiasType>(
+      expanded_num_rows, num_rows, fc2_a_expert_stride, fc2_b_expert_stride,
+      lora_params.num_lora_adapters, lora_params.max_low_rank, num_experts_per_node,
+      expert_first_token_offset_, permuted_row_to_unpermuted_row_, lora_params.token_lora_indices,
+      lora_params.token_lora_indices_is_int64, lora_params.fc2_lora_ranks,
+      lora_params.fc2_lora_weight_ptrs, lora_params.permuted_fc2_lora_ranks,
+      lora_params.permuted_fc2_lora_weight_ptrs, stream);
 
   if (is_gated_activation) {
-    host_permuted_gated_weight_ptrs.resize(expanded_num_rows * 2);
-    host_permuted_gated_lora_ranks.resize(expanded_num_rows);
+    prepareLoraMetadata<ScaleBiasType>(
+        expanded_num_rows, num_rows, fc1_a_expert_stride, fc1_b_expert_stride,
+        lora_params.num_lora_adapters, lora_params.max_low_rank, num_experts_per_node,
+        expert_first_token_offset_, permuted_row_to_unpermuted_row_, lora_params.token_lora_indices,
+        lora_params.token_lora_indices_is_int64, lora_params.gated_lora_ranks,
+        lora_params.gated_lora_weight_ptrs, lora_params.permuted_gated_lora_ranks,
+        lora_params.permuted_gated_lora_weight_ptrs, stream);
   }
 
-  TLLM_CUDA_CHECK(cudaEventSynchronize(*(lora_params.memcpy_event_ptr)));
-
-  size_t num_valid_tokens =
-      needs_num_valid ? host_expert_first_token_offset[num_experts_per_node] : expanded_num_rows;
-
-  for (int expert_idx = 0; expert_idx < num_experts_per_node; ++expert_idx) {
-    int weight_index = expert_idx + start_expert;
-    for (size_t i = host_expert_first_token_offset[expert_idx];
-         i < host_expert_first_token_offset[expert_idx + 1]; ++i) {
-      int source_index = host_permuted_rows[i] % num_rows;
-      int32_t lora_rank = lora_params.fc1_lora_ranks[source_index];
-      host_permuted_fc1_weight_ptrs[i * 2] =
-          reinterpret_cast<ScaleBiasType const*>(
-              lora_params.fc1_lora_weight_ptrs[source_index * 2]) +
-          weight_index * hidden_size * lora_rank;
-      host_permuted_fc1_weight_ptrs[i * 2 + 1] =
-          reinterpret_cast<ScaleBiasType const*>(
-              lora_params.fc1_lora_weight_ptrs[source_index * 2 + 1]) +
-          weight_index * lora_rank * inter_size;
-      host_permuted_fc1_lora_ranks[i] = lora_rank;
-
-      lora_rank = lora_params.fc2_lora_ranks[source_index];
-      host_permuted_fc2_weight_ptrs[i * 2] =
-          reinterpret_cast<ScaleBiasType const*>(
-              lora_params.fc2_lora_weight_ptrs[source_index * 2]) +
-          weight_index * inter_size * lora_rank;
-      host_permuted_fc2_weight_ptrs[i * 2 + 1] =
-          reinterpret_cast<ScaleBiasType const*>(
-              lora_params.fc2_lora_weight_ptrs[source_index * 2 + 1]) +
-          weight_index * lora_rank * hidden_size;
-      host_permuted_fc2_lora_ranks[i] = lora_rank;
-
-      if (host_permuted_fc1_lora_ranks[i] || host_permuted_fc2_lora_ranks[i]) {
-        all_token_without_lora = false;
-      }
-
-      if (is_gated_activation) {
-        lora_rank = lora_params.gated_lora_ranks[source_index];
-        host_permuted_gated_weight_ptrs[i * 2] =
-            reinterpret_cast<ScaleBiasType const*>(
-                lora_params.gated_lora_weight_ptrs[source_index * 2]) +
-            weight_index * hidden_size * lora_rank;
-        host_permuted_gated_weight_ptrs[i * 2 + 1] =
-            reinterpret_cast<ScaleBiasType const*>(
-                lora_params.gated_lora_weight_ptrs[source_index * 2 + 1]) +
-            weight_index * lora_rank * inter_size;
-        host_permuted_gated_lora_ranks[i] = lora_rank;
-
-        if (host_permuted_gated_lora_ranks[i]) {
-          all_token_without_lora = false;
-        }
-      }
-    }
-  }
-  return all_token_without_lora;
+  return false;
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
@@ -3467,18 +3524,7 @@ auto CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
                                          LoraParams& lora_params, float const* input_fp8_dequant,
                                          cudaStream_t stream) -> ScaleBiasType const* {
   TLLM_CHECK_WITH_INFO(!act_fp4, "LoRA does not support FP4 activations");
-  std::vector<void const*>& host_permuted_fc1_weight_ptrs =
-      host_lora_workspace_.host_permuted_fc1_weight_ptrs;
-  std::vector<void const*>& host_permuted_gated_weight_ptrs =
-      host_lora_workspace_.host_permuted_gated_weight_ptrs;
-
-  std::vector<int32_t>& host_permuted_fc1_lora_ranks =
-      host_lora_workspace_.host_permuted_fc1_lora_ranks;
-  std::vector<int32_t>& host_permuted_gated_lora_ranks =
-      host_lora_workspace_.host_permuted_gated_lora_ranks;
-  std::vector<int64_t>& host_expert_first_token_offset =
-      host_lora_workspace_.host_expert_first_token_offset;
-
+  (void)start_expert;
   auto fc1_lora_impl = lora_params.fc1_lora_impl;
   int num_reqs = lora_params.num_reqs;
 
@@ -3506,21 +3552,21 @@ auto CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
 
   void* lora_workspace = lora_params.workspace;
   void* tmp_lora_fc_result = static_cast<void*>(lora_fc1_result);
-  int64_t num_valid_tokens = host_expert_first_token_offset[num_experts_per_node];
+  int64_t num_valid_tokens = expanded_num_rows;
   int64_t num_reqs_lora =
       std::min(num_valid_tokens, static_cast<int64_t>(num_reqs * num_experts_per_node));
 
-  ::tensorrt_llm::kernels::Lora_run(fc1_lora_impl.get(), num_valid_tokens, num_reqs_lora, input,
-                                    host_permuted_fc1_lora_ranks.data(),
-                                    host_permuted_fc1_weight_ptrs.data(), 0, &tmp_lora_fc_result,
-                                    lora_workspace, stream);
+  ::tensorrt_llm::kernels::Lora_run_device(fc1_lora_impl.get(), num_valid_tokens, num_reqs_lora,
+                                           input, lora_params.permuted_fc1_lora_ranks,
+                                           lora_params.permuted_fc1_lora_weight_ptrs, 0,
+                                           &tmp_lora_fc_result, lora_workspace, stream);
 
   if (is_gated_activation) {
     void* tmp_lora_gated_result = static_cast<void*>(lora_gated_out);
-    ::tensorrt_llm::kernels::Lora_run(fc1_lora_impl.get(), num_valid_tokens, num_reqs_lora, input,
-                                      host_permuted_gated_lora_ranks.data(),
-                                      host_permuted_gated_weight_ptrs.data(), 0,
-                                      &tmp_lora_gated_result, lora_workspace, stream);
+    ::tensorrt_llm::kernels::Lora_run_device(fc1_lora_impl.get(), num_valid_tokens, num_reqs_lora,
+                                             input, lora_params.permuted_gated_lora_ranks,
+                                             lora_params.permuted_gated_lora_weight_ptrs, 0,
+                                             &tmp_lora_gated_result, lora_workspace, stream);
   }
 
   // add bias and reorder
@@ -3546,12 +3592,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
                                          int64_t const* num_valid_tokens_ptr, int64_t num_tokens,
                                          LoraParams& lora_params, float const* fc2_fp8_quant,
                                          cudaStream_t stream) {
-  std::vector<void const*>& host_permuted_fc2_weight_ptrs =
-      host_lora_workspace_.host_permuted_fc2_weight_ptrs;
-  std::vector<int32_t>& host_permuted_fc2_lora_ranks =
-      host_lora_workspace_.host_permuted_fc2_lora_ranks;
-  std::vector<int64_t>& host_expert_first_token_offset =
-      host_lora_workspace_.host_expert_first_token_offset;
+  (void)start_expert;
   auto fc2_lora_impl = lora_params.fc2_lora_impl;
   int num_reqs = lora_params.num_reqs;
 
@@ -3569,15 +3610,15 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
   }
 
   void* lora_workspace = lora_params.workspace;
-  int64_t num_valid_tokens = host_expert_first_token_offset[num_experts_per_node];
+  int64_t num_valid_tokens = num_tokens;
   void* tmp_lora_fc_result = static_cast<void*>(lora_fc2_result_);
   int64_t num_reqs_lora =
       std::min(num_valid_tokens, static_cast<int64_t>(num_reqs * num_experts_per_node));
 
-  ::tensorrt_llm::kernels::Lora_run(fc2_lora_impl.get(), num_valid_tokens, num_reqs_lora, input,
-                                    host_permuted_fc2_lora_ranks.data(),
-                                    host_permuted_fc2_weight_ptrs.data(), 0, &tmp_lora_fc_result,
-                                    lora_workspace, stream);
+  ::tensorrt_llm::kernels::Lora_run_device(fc2_lora_impl.get(), num_valid_tokens, num_reqs_lora,
+                                           input, lora_params.permuted_fc2_lora_ranks,
+                                           lora_params.permuted_fc2_lora_weight_ptrs, 0,
+                                           &tmp_lora_fc_result, lora_workspace, stream);
   sync_check_cuda_error(stream);
 }
 
@@ -3836,21 +3877,6 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
     sync_check_cuda_error(stream);
 
     bool is_gated_activation = isGatedActivation(fc1_activation_type);
-
-    if (use_lora) {
-      std::vector<int>& host_permuted_rows = host_lora_workspace_.host_permuted_rows;
-      std::vector<int64_t>& host_expert_first_token_offset =
-          host_lora_workspace_.host_expert_first_token_offset;
-      host_permuted_rows.resize(expanded_num_rows);
-      TLLM_CUDA_CHECK(tensorrt_llm::common::cudaMemcpyAsyncSanitized(
-          host_permuted_rows.data(), permuted_row_to_unpermuted_row_,
-          expanded_num_rows * sizeof(int), cudaMemcpyDeviceToHost, stream));
-      host_expert_first_token_offset.resize(num_experts_per_node + 1);
-      TLLM_CUDA_CHECK(tensorrt_llm::common::cudaMemcpyAsyncSanitized(
-          host_expert_first_token_offset.data(), expert_first_token_offset_,
-          (num_experts_per_node + 1) * sizeof(int64_t), cudaMemcpyDeviceToHost, stream));
-      TLLM_CUDA_CHECK(cudaEventRecord(*(lora_params.memcpy_event_ptr), stream));
-    }
 
     // Only NVFP4xNVFP4 supports FC1 per-expert act scale
     bool use_per_expert_act_scale = use_fp4 ? quant_params.fp4.fc1.use_per_expert_act_scale : false;
