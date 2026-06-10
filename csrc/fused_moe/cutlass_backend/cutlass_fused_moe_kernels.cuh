@@ -18,8 +18,10 @@
 #include <cuda_fp16.h>
 #include <float.h>
 #include <math.h>
+#include <mma.h>
 
 #include <algorithm>
+#include <cstring>
 #include <memory>
 #include <numeric>
 #include <random>
@@ -865,6 +867,305 @@ void mergeExpertPrefixSum(int const* blocked_expert_counts, int const* blocked_e
                      unpermuted_row_to_permuted_row, num_tokens);
 }
 
+template <int kNumTokensPerBlock, typename TokenIndexT>
+__global__ void blockExpertAdapterPrefixSumKernel(
+    int const* token_selected_experts, TokenIndexT const* token_lora_indices,
+    int* blocked_expert_adapter_counts, int* blocked_row_to_unpermuted_row,
+    int64_t const num_tokens, int64_t const num_experts_per_token, int const start_expert_id,
+    int const num_lora_adapters) {
+  using BlockScan = cub::BlockScan<int, kNumTokensPerBlock>;
+  __shared__ typename BlockScan::TempStorage temp_storage;
+
+  int const target_expert_id = blockIdx.x;
+  int const target_adapter_bucket = blockIdx.y;
+  int const block_id = blockIdx.z;
+  int const num_blocks_per_seq = gridDim.z;
+  int const token_id = block_id * kNumTokensPerBlock + threadIdx.x;
+  int const adapter_bucket_count = num_lora_adapters + 1;
+  int const target_lora_idx = target_adapter_bucket - 1;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
+
+  int expanded_token_id = -1;
+  if (token_id < num_tokens) {
+    int64_t const raw_lora_idx = static_cast<int64_t>(token_lora_indices[token_id]);
+    int const lora_bucket = (raw_lora_idx >= 0 && raw_lora_idx < num_lora_adapters)
+                                ? static_cast<int>(raw_lora_idx)
+                                : -1;
+    if (lora_bucket == target_lora_idx) {
+      for (int i = 0; i < num_experts_per_token; i++) {
+        int const expert_id =
+            token_selected_experts[token_id * num_experts_per_token + i] - start_expert_id;
+        if (expert_id == target_expert_id) {
+          expanded_token_id = i * num_tokens + token_id;
+          break;
+        }
+      }
+    }
+  }
+
+  int const has_matched = expanded_token_id >= 0 ? 1 : 0;
+  int index;
+  BlockScan(temp_storage).ExclusiveSum(has_matched, index);
+
+  int const bucket =
+      (target_expert_id * adapter_bucket_count + target_adapter_bucket) * num_blocks_per_seq +
+      block_id;
+  if (has_matched) {
+    blocked_row_to_unpermuted_row[static_cast<int64_t>(target_expert_id) * adapter_bucket_count *
+                                      num_tokens +
+                                  static_cast<int64_t>(target_adapter_bucket) * num_tokens +
+                                  block_id * kNumTokensPerBlock + index] = expanded_token_id;
+  }
+  if (threadIdx.x == kNumTokensPerBlock - 1) {
+    blocked_expert_adapter_counts[bucket] = index + has_matched;
+  }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+template <typename TokenIndexT>
+void blockExpertAdapterPrefixSum(
+    int const* token_selected_experts, TokenIndexT const* token_lora_indices,
+    int* blocked_expert_adapter_counts, int* blocked_row_to_unpermuted_row,
+    int64_t const num_tokens, int64_t const num_experts_per_node,
+    int64_t const num_experts_per_token, int64_t const num_tokens_per_block,
+    int64_t const num_blocks_per_seq, int const start_expert_id, int const num_lora_adapters,
+    bool enable_pdl, cudaStream_t stream) {
+  dim3 const blocks(num_experts_per_node, num_lora_adapters + 1, num_blocks_per_seq);
+  dim3 const threads(num_tokens_per_block);
+
+  cudaLaunchConfig_t config;
+  config.gridDim = blocks;
+  config.blockDim = threads;
+  config.dynamicSmemBytes = 0;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+  config.numAttrs = 1;
+  config.attrs = attrs;
+
+  auto func = blockExpertAdapterPrefixSumKernel<1024, TokenIndexT>;
+  if (num_tokens_per_block <= 32) {
+    func = blockExpertAdapterPrefixSumKernel<32, TokenIndexT>;
+  } else if (num_tokens_per_block <= 64) {
+    func = blockExpertAdapterPrefixSumKernel<64, TokenIndexT>;
+  } else if (num_tokens_per_block <= 128) {
+    func = blockExpertAdapterPrefixSumKernel<128, TokenIndexT>;
+  } else if (num_tokens_per_block <= 256) {
+    func = blockExpertAdapterPrefixSumKernel<256, TokenIndexT>;
+  } else if (num_tokens_per_block <= 512) {
+    func = blockExpertAdapterPrefixSumKernel<512, TokenIndexT>;
+  }
+  cudaLaunchKernelEx(&config, func, token_selected_experts, token_lora_indices,
+                     blocked_expert_adapter_counts, blocked_row_to_unpermuted_row, num_tokens,
+                     num_experts_per_token, start_expert_id, num_lora_adapters);
+}
+
+template <int kNumThreadsPerBlock>
+__global__ void globalExpertAdapterPrefixSumLargeKernel(int const* blocked_expert_adapter_counts,
+                                                        int* blocked_expert_adapter_counts_cumsum,
+                                                        int64_t* expert_first_token_offset,
+                                                        int64_t const num_experts_per_node,
+                                                        int64_t const num_blocks_per_seq,
+                                                        int const adapter_bucket_count,
+                                                        int64_t const num_elem_per_thread) {
+  using BlockScan = cub::BlockScan<int, kNumThreadsPerBlock>;
+  __shared__ typename BlockScan::TempStorage temp_storage;
+
+  int offset = threadIdx.x * num_elem_per_thread;
+  int cnt = 0;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
+
+  int64_t const num_elements =
+      num_experts_per_node * static_cast<int64_t>(adapter_bucket_count) * num_blocks_per_seq;
+  for (int i = 0; i < num_elem_per_thread; i++) {
+    if (offset + i < num_elements) {
+      cnt += blocked_expert_adapter_counts[offset + i];
+    }
+  }
+
+  int cumsum;
+  BlockScan(temp_storage).ExclusiveSum(cnt, cumsum);
+
+  for (int i = 0; i < num_elem_per_thread; i++) {
+    int const element = offset + i;
+    if (element < num_elements) {
+      blocked_expert_adapter_counts_cumsum[element] = cumsum;
+      if (element % (adapter_bucket_count * num_blocks_per_seq) == 0) {
+        expert_first_token_offset[element / (adapter_bucket_count * num_blocks_per_seq)] = cumsum;
+      }
+      cumsum += blocked_expert_adapter_counts[element];
+      if (element == num_elements - 1) {
+        expert_first_token_offset[num_experts_per_node] = cumsum;
+      }
+    }
+  }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+template <int kNumThreadsPerBlock>
+__global__ void globalExpertAdapterPrefixSumKernel(int const* blocked_expert_adapter_counts,
+                                                   int* blocked_expert_adapter_counts_cumsum,
+                                                   int64_t* expert_first_token_offset,
+                                                   int64_t const num_experts_per_node,
+                                                   int64_t const num_blocks_per_seq,
+                                                   int const adapter_bucket_count) {
+  using BlockScan = cub::BlockScan<int, kNumThreadsPerBlock>;
+  __shared__ typename BlockScan::TempStorage temp_storage;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
+
+  int64_t const num_elements =
+      num_experts_per_node * static_cast<int64_t>(adapter_bucket_count) * num_blocks_per_seq;
+  int const cnt = threadIdx.x < num_elements ? blocked_expert_adapter_counts[threadIdx.x] : 0;
+  int cumsum;
+  BlockScan(temp_storage).ExclusiveSum(cnt, cumsum);
+
+  if (threadIdx.x < num_elements) {
+    blocked_expert_adapter_counts_cumsum[threadIdx.x] = cumsum;
+    if (threadIdx.x % (adapter_bucket_count * num_blocks_per_seq) == 0) {
+      expert_first_token_offset[threadIdx.x / (adapter_bucket_count * num_blocks_per_seq)] = cumsum;
+    }
+    if (threadIdx.x == num_elements - 1) {
+      expert_first_token_offset[num_experts_per_node] = cumsum + cnt;
+    }
+  }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+void globalExpertAdapterPrefixSum(int const* blocked_expert_adapter_counts,
+                                  int* blocked_expert_adapter_counts_cumsum,
+                                  int64_t* expert_first_token_offset,
+                                  int64_t const num_experts_per_node,
+                                  int64_t const num_tokens_per_block,
+                                  int64_t const num_blocks_per_seq, int const adapter_bucket_count,
+                                  bool enable_pdl, cudaStream_t stream) {
+  int64_t const num_elements =
+      num_experts_per_node * static_cast<int64_t>(adapter_bucket_count) * num_blocks_per_seq;
+
+  cudaLaunchConfig_t config;
+  config.gridDim = 1;
+  config.blockDim = 1024;
+  config.dynamicSmemBytes = 0;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+  config.numAttrs = 1;
+  config.attrs = attrs;
+
+  if (num_elements <= 1024) {
+    auto func = globalExpertAdapterPrefixSumKernel<1024>;
+    if (num_elements <= 32) {
+      func = globalExpertAdapterPrefixSumKernel<32>;
+      config.blockDim = 32;
+    } else if (num_elements <= 64) {
+      func = globalExpertAdapterPrefixSumKernel<64>;
+      config.blockDim = 64;
+    } else if (num_elements <= 128) {
+      func = globalExpertAdapterPrefixSumKernel<128>;
+      config.blockDim = 128;
+    } else if (num_elements <= 256) {
+      func = globalExpertAdapterPrefixSumKernel<256>;
+      config.blockDim = 256;
+    } else if (num_elements <= 512) {
+      func = globalExpertAdapterPrefixSumKernel<512>;
+      config.blockDim = 512;
+    }
+    cudaLaunchKernelEx(&config, func, blocked_expert_adapter_counts,
+                       blocked_expert_adapter_counts_cumsum, expert_first_token_offset,
+                       num_experts_per_node, num_blocks_per_seq, adapter_bucket_count);
+  } else {
+    auto func = globalExpertAdapterPrefixSumLargeKernel<1024>;
+    int64_t const num_elem_per_thread = tensorrt_llm::common::ceilDiv(num_elements, 1024);
+    cudaLaunchKernelEx(&config, func, blocked_expert_adapter_counts,
+                       blocked_expert_adapter_counts_cumsum, expert_first_token_offset,
+                       num_experts_per_node, num_blocks_per_seq, adapter_bucket_count,
+                       num_elem_per_thread);
+  }
+}
+
+__global__ void mergeExpertAdapterPrefixSumKernel(
+    int const* blocked_expert_adapter_counts, int const* blocked_expert_adapter_counts_cumsum,
+    int const* blocked_row_to_unpermuted_row, int* permuted_token_selected_experts,
+    int* permuted_row_to_unpermuted_row, int* unpermuted_row_to_permuted_row, int const num_tokens,
+    int const adapter_bucket_count) {
+  int const target_expert_id = blockIdx.x;
+  int const target_adapter_bucket = blockIdx.y;
+  int const block_id = blockIdx.z;
+  int const num_blocks_per_seq = gridDim.z;
+  int const token_id = block_id * blockDim.x + threadIdx.x;
+  int const bucket =
+      (target_expert_id * adapter_bucket_count + target_adapter_bucket) * num_blocks_per_seq +
+      block_id;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
+
+  int const cnt = blocked_expert_adapter_counts[bucket];
+  int const offset = blocked_expert_adapter_counts_cumsum[bucket];
+  if (threadIdx.x < cnt) {
+    int const unpermuted_row =
+        blocked_row_to_unpermuted_row[static_cast<int64_t>(target_expert_id) *
+                                          adapter_bucket_count * num_tokens +
+                                      static_cast<int64_t>(target_adapter_bucket) * num_tokens +
+                                      token_id];
+    int const permuted_row = offset + threadIdx.x;
+    permuted_row_to_unpermuted_row[permuted_row] = unpermuted_row;
+    permuted_token_selected_experts[permuted_row] = target_expert_id;
+    unpermuted_row_to_permuted_row[unpermuted_row] = permuted_row;
+  }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+void mergeExpertAdapterPrefixSum(
+    int const* blocked_expert_adapter_counts, int const* blocked_expert_adapter_counts_cumsum,
+    int const* blocked_row_to_unpermuted_row, int* permuted_token_selected_experts,
+    int* permuted_row_to_unpermuted_row, int* unpermuted_row_to_permuted_row,
+    int64_t const num_tokens, int64_t const num_experts_per_node,
+    int64_t const num_tokens_per_block, int64_t const num_blocks_per_seq,
+    int const adapter_bucket_count, bool enable_pdl, cudaStream_t stream) {
+  dim3 const blocks(num_experts_per_node, adapter_bucket_count, num_blocks_per_seq);
+  dim3 const threads(num_tokens_per_block);
+
+  cudaLaunchConfig_t config;
+  config.gridDim = blocks;
+  config.blockDim = threads;
+  config.dynamicSmemBytes = 0;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+  config.numAttrs = 1;
+  config.attrs = attrs;
+
+  cudaLaunchKernelEx(&config, mergeExpertAdapterPrefixSumKernel, blocked_expert_adapter_counts,
+                     blocked_expert_adapter_counts_cumsum, blocked_row_to_unpermuted_row,
+                     permuted_token_selected_experts, permuted_row_to_unpermuted_row,
+                     unpermuted_row_to_permuted_row, num_tokens, adapter_bucket_count);
+}
+
 // threeStepBuildExpertMapsSortFirstToken uses three kernels to achieve the sort of
 // token_selected_experts
 
@@ -922,6 +1223,200 @@ void threeStepBuildExpertMapsSortFirstToken(
                        permuted_row_to_unpermuted_row, unpermuted_row_to_permuted_row, num_tokens,
                        num_experts_per_node, num_tokens_per_block, num_blocks_per_seq, enable_pdl,
                        stream);
+}
+
+template <typename TokenIndexT>
+void threeStepBuildExpertAdapterMapsSortFirstTokenImpl(
+    int const* token_selected_experts, TokenIndexT const* token_lora_indices,
+    int* permuted_token_selected_experts, int* permuted_row_to_unpermuted_row,
+    int* unpermuted_row_to_permuted_row, int64_t* expert_first_token_offset,
+    int* blocked_expert_adapter_counts, int* blocked_expert_adapter_counts_cumsum,
+    int* blocked_row_to_unpermuted_row, int64_t const num_tokens,
+    int64_t const num_experts_per_node, int64_t const num_experts_per_token,
+    int const start_expert_id, int const num_lora_adapters, bool enable_pdl, cudaStream_t stream) {
+  int64_t const num_tokens_per_block = computeNumTokensPerBlock(num_tokens, num_experts_per_node);
+  int64_t const num_blocks_per_seq =
+      tensorrt_llm::common::ceilDiv(num_tokens, num_tokens_per_block);
+  int const adapter_bucket_count = num_lora_adapters + 1;
+
+  blockExpertAdapterPrefixSum(token_selected_experts, token_lora_indices,
+                              blocked_expert_adapter_counts, blocked_row_to_unpermuted_row,
+                              num_tokens, num_experts_per_node, num_experts_per_token,
+                              num_tokens_per_block, num_blocks_per_seq, start_expert_id,
+                              num_lora_adapters, enable_pdl, stream);
+  sync_check_cuda_error(stream);
+
+  globalExpertAdapterPrefixSum(blocked_expert_adapter_counts, blocked_expert_adapter_counts_cumsum,
+                               expert_first_token_offset, num_experts_per_node,
+                               num_tokens_per_block, num_blocks_per_seq, adapter_bucket_count,
+                               enable_pdl, stream);
+  sync_check_cuda_error(stream);
+
+  mergeExpertAdapterPrefixSum(blocked_expert_adapter_counts, blocked_expert_adapter_counts_cumsum,
+                              blocked_row_to_unpermuted_row, permuted_token_selected_experts,
+                              permuted_row_to_unpermuted_row, unpermuted_row_to_permuted_row,
+                              num_tokens, num_experts_per_node, num_tokens_per_block,
+                              num_blocks_per_seq, adapter_bucket_count, enable_pdl, stream);
+}
+
+void threeStepBuildExpertAdapterMapsSortFirstToken(
+    int const* token_selected_experts, void const* token_lora_indices,
+    bool token_lora_indices_is_int64, int* permuted_token_selected_experts,
+    int* permuted_row_to_unpermuted_row, int* unpermuted_row_to_permuted_row,
+    int64_t* expert_first_token_offset, int* blocked_expert_adapter_counts,
+    int* blocked_expert_adapter_counts_cumsum, int* blocked_row_to_unpermuted_row,
+    int64_t const num_tokens, int64_t const num_experts_per_node,
+    int64_t const num_experts_per_token, int const start_expert_id, int const num_lora_adapters,
+    bool enable_pdl, cudaStream_t stream) {
+  if (token_lora_indices_is_int64) {
+    threeStepBuildExpertAdapterMapsSortFirstTokenImpl(
+        token_selected_experts, static_cast<int64_t const*>(token_lora_indices),
+        permuted_token_selected_experts, permuted_row_to_unpermuted_row,
+        unpermuted_row_to_permuted_row, expert_first_token_offset, blocked_expert_adapter_counts,
+        blocked_expert_adapter_counts_cumsum, blocked_row_to_unpermuted_row, num_tokens,
+        num_experts_per_node, num_experts_per_token, start_expert_id, num_lora_adapters, enable_pdl,
+        stream);
+  } else {
+    threeStepBuildExpertAdapterMapsSortFirstTokenImpl(
+        token_selected_experts, static_cast<int32_t const*>(token_lora_indices),
+        permuted_token_selected_experts, permuted_row_to_unpermuted_row,
+        unpermuted_row_to_permuted_row, expert_first_token_offset, blocked_expert_adapter_counts,
+        blocked_expert_adapter_counts_cumsum, blocked_row_to_unpermuted_row, num_tokens,
+        num_experts_per_node, num_experts_per_token, start_expert_id, num_lora_adapters, enable_pdl,
+        stream);
+  }
+}
+
+template <typename TokenIndexT>
+__global__ void countExpertAdapterRowsKernel(int const* permuted_row_to_unpermuted_row,
+                                             int64_t const* expert_first_token_offset,
+                                             TokenIndexT const* token_lora_indices,
+                                             int* adapter_bucket_counts, int64_t const num_tokens,
+                                             int const adapter_bucket_count) {
+  int const expert = blockIdx.x;
+  int64_t const begin = expert_first_token_offset[expert];
+  int64_t const end = expert_first_token_offset[expert + 1];
+  for (int64_t row = begin + threadIdx.x; row < end; row += blockDim.x) {
+    int const source_index = permuted_row_to_unpermuted_row[row] % num_tokens;
+    int64_t const raw_lora_idx = static_cast<int64_t>(token_lora_indices[source_index]);
+    int const bucket = (raw_lora_idx >= 0 && raw_lora_idx < adapter_bucket_count - 1)
+                           ? static_cast<int>(raw_lora_idx) + 1
+                           : 0;
+    atomicAdd(adapter_bucket_counts + expert * adapter_bucket_count + bucket, 1);
+  }
+}
+
+__global__ void buildExpertAdapterRowStartsKernel(int const* adapter_bucket_counts,
+                                                  int* adapter_bucket_offsets,
+                                                  int* adapter_bucket_cursors,
+                                                  int64_t const* expert_first_token_offset,
+                                                  int const adapter_bucket_count) {
+  int const expert = blockIdx.x;
+  if (threadIdx.x != 0) {
+    return;
+  }
+  int running = static_cast<int>(expert_first_token_offset[expert]);
+  for (int bucket = 0; bucket < adapter_bucket_count; ++bucket) {
+    int const idx = expert * adapter_bucket_count + bucket;
+    adapter_bucket_offsets[idx] = running;
+    running += adapter_bucket_counts[idx];
+    adapter_bucket_cursors[idx] = 0;
+  }
+}
+
+template <typename TokenIndexT>
+__global__ void scatterExpertAdapterRowsKernel(
+    int const* old_permuted_row_to_unpermuted_row, int* new_permuted_row_to_unpermuted_row,
+    int* unpermuted_row_to_permuted_row, int* permuted_token_selected_experts,
+    int64_t const* expert_first_token_offset, TokenIndexT const* token_lora_indices,
+    int* adapter_bucket_cursors, int const* adapter_bucket_offsets, int64_t const num_tokens,
+    int const adapter_bucket_count) {
+  int const expert = blockIdx.x;
+  int64_t const begin = expert_first_token_offset[expert];
+  int64_t const end = expert_first_token_offset[expert + 1];
+  for (int64_t old_row = begin + threadIdx.x; old_row < end; old_row += blockDim.x) {
+    int const unpermuted_row = old_permuted_row_to_unpermuted_row[old_row];
+    int const source_index = unpermuted_row % num_tokens;
+    int64_t const raw_lora_idx = static_cast<int64_t>(token_lora_indices[source_index]);
+    int const bucket = (raw_lora_idx >= 0 && raw_lora_idx < adapter_bucket_count - 1)
+                           ? static_cast<int>(raw_lora_idx) + 1
+                           : 0;
+    int const idx = expert * adapter_bucket_count + bucket;
+    int const offset = atomicAdd(adapter_bucket_cursors + idx, 1);
+    int const new_row = adapter_bucket_offsets[idx] + offset;
+    new_permuted_row_to_unpermuted_row[new_row] = unpermuted_row;
+    permuted_token_selected_experts[new_row] = expert;
+    unpermuted_row_to_permuted_row[unpermuted_row] = new_row;
+  }
+}
+
+__global__ void copyRegroupedRowsKernel(int const* src, int* dst, int64_t num_rows) {
+  for (int64_t row = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; row < num_rows;
+       row += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    dst[row] = src[row];
+  }
+}
+
+template <typename TokenIndexT>
+void regroupExpertRowsByLoraAdapterImpl(
+    int* permuted_token_selected_experts, int* permuted_row_to_unpermuted_row,
+    int* unpermuted_row_to_permuted_row, int64_t const* expert_first_token_offset,
+    TokenIndexT const* token_lora_indices, int* adapter_bucket_counts, int* adapter_bucket_offsets,
+    int* temp_permuted_row_to_unpermuted_row, int64_t num_tokens, int64_t expanded_num_rows,
+    int num_experts_per_node, int num_lora_adapters, bool copy_regrouped_rows,
+    cudaStream_t stream) {
+  int const adapter_bucket_count = num_lora_adapters + 1;
+  int const bucket_count = num_experts_per_node * adapter_bucket_count;
+  TLLM_CUDA_CHECK(cudaMemsetAsync(adapter_bucket_counts, 0, bucket_count * sizeof(int), stream));
+
+  constexpr int threads = 256;
+  countExpertAdapterRowsKernel<<<num_experts_per_node, threads, 0, stream>>>(
+      permuted_row_to_unpermuted_row, expert_first_token_offset, token_lora_indices,
+      adapter_bucket_counts, num_tokens, adapter_bucket_count);
+  buildExpertAdapterRowStartsKernel<<<num_experts_per_node, 1, 0, stream>>>(
+      adapter_bucket_counts, adapter_bucket_offsets, adapter_bucket_counts,
+      expert_first_token_offset, adapter_bucket_count);
+  scatterExpertAdapterRowsKernel<<<num_experts_per_node, threads, 0, stream>>>(
+      permuted_row_to_unpermuted_row, temp_permuted_row_to_unpermuted_row,
+      unpermuted_row_to_permuted_row, permuted_token_selected_experts, expert_first_token_offset,
+      token_lora_indices, adapter_bucket_counts, adapter_bucket_offsets, num_tokens,
+      adapter_bucket_count);
+  if (copy_regrouped_rows) {
+    int const copy_blocks =
+        static_cast<int>(std::min<int64_t>((expanded_num_rows + threads - 1) / threads, 65535));
+    copyRegroupedRowsKernel<<<copy_blocks, threads, 0, stream>>>(
+        temp_permuted_row_to_unpermuted_row, permuted_row_to_unpermuted_row, expanded_num_rows);
+  }
+}
+
+bool regroupExpertRowsByLoraAdapter(
+    int* permuted_token_selected_experts, int* permuted_row_to_unpermuted_row,
+    int* unpermuted_row_to_permuted_row, int64_t const* expert_first_token_offset,
+    void const* token_lora_indices, bool token_lora_indices_is_int64, int* adapter_bucket_counts,
+    int* adapter_bucket_offsets, int* temp_permuted_row_to_unpermuted_row, int64_t num_tokens,
+    int64_t expanded_num_rows, int num_experts_per_node, int num_lora_adapters,
+    int64_t routing_bucket_capacity, bool copy_regrouped_rows, cudaStream_t stream) {
+  int const adapter_bucket_count = num_lora_adapters + 1;
+  if (token_lora_indices == nullptr || num_lora_adapters <= 0 ||
+      static_cast<int64_t>(num_experts_per_node) * adapter_bucket_count > routing_bucket_capacity) {
+    return false;
+  }
+  if (token_lora_indices_is_int64) {
+    regroupExpertRowsByLoraAdapterImpl(
+        permuted_token_selected_experts, permuted_row_to_unpermuted_row,
+        unpermuted_row_to_permuted_row, expert_first_token_offset,
+        static_cast<int64_t const*>(token_lora_indices), adapter_bucket_counts,
+        adapter_bucket_offsets, temp_permuted_row_to_unpermuted_row, num_tokens, expanded_num_rows,
+        num_experts_per_node, num_lora_adapters, copy_regrouped_rows, stream);
+  } else {
+    regroupExpertRowsByLoraAdapterImpl(
+        permuted_token_selected_experts, permuted_row_to_unpermuted_row,
+        unpermuted_row_to_permuted_row, expert_first_token_offset,
+        static_cast<int32_t const*>(token_lora_indices), adapter_bucket_counts,
+        adapter_bucket_offsets, temp_permuted_row_to_unpermuted_row, num_tokens, expanded_num_rows,
+        num_experts_per_node, num_lora_adapters, copy_regrouped_rows, stream);
+  }
+  return true;
 }
 
 // ============================== Infer GEMM sizes =================================
@@ -1421,6 +1916,76 @@ __host__ __device__ constexpr static U arrayConvert(T const& input) {
 // source matrix, we simply take the modulus of the expanded index.
 
 constexpr static int EXPAND_THREADS_PER_BLOCK = 256;
+constexpr static int EXPAND_SCATTER_MAX_K = 16;
+
+template <class ActivationsType>
+__global__ void expandInputRowsScatterKernel(ActivationsType const* unpermuted_input,
+                                             ActivationsType* permuted_output,
+                                             float const* unpermuted_scales, float* permuted_scales,
+                                             int const* unpermuted_row_to_permuted_row,
+                                             int const* token_selected_experts,
+                                             int64_t const num_tokens, int64_t const hidden_size,
+                                             int64_t const k, int const num_experts_per_node,
+                                             int const start_expert_id) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
+
+  constexpr int64_t ELEM_PER_THREAD = 128 / sizeof_bits<ActivationsType>::value;
+  static_assert(ELEM_PER_THREAD > 0, "Expected a valid vector width");
+
+  int64_t const num_elems_in_col = hidden_size / ELEM_PER_THREAD;
+  assert(hidden_size % ELEM_PER_THREAD == 0);
+
+  using DataElem = cutlass::Array<ActivationsType, ELEM_PER_THREAD>;
+  auto const* input_v = reinterpret_cast<DataElem const*>(unpermuted_input);
+  auto* output_v = reinterpret_cast<DataElem*>(permuted_output);
+
+  __shared__ int permuted_rows[EXPAND_SCATTER_MAX_K];
+
+  for (int64_t source_row = blockIdx.x; source_row < num_tokens; source_row += gridDim.x) {
+    if (threadIdx.x < k) {
+      int const k_idx = threadIdx.x;
+      int const expert_id = token_selected_experts[source_row * k + k_idx] - start_expert_id;
+      int permuted_row = -1;
+      if (expert_id >= 0 && expert_id < num_experts_per_node) {
+        int64_t const expanded_original_row = source_row + static_cast<int64_t>(k_idx) * num_tokens;
+        permuted_row = unpermuted_row_to_permuted_row[expanded_original_row];
+        int64_t const expanded_rows = num_tokens * k;
+        if (permuted_row < 0 || static_cast<int64_t>(permuted_row) >= expanded_rows) {
+          permuted_row = -1;
+        }
+      }
+      permuted_rows[k_idx] = permuted_row;
+      if (permuted_scales && permuted_row >= 0) {
+        int64_t const source_k_idx = source_row * k + k_idx;
+        permuted_scales[permuted_row] = unpermuted_scales ? unpermuted_scales[source_k_idx] : 1.0f;
+      }
+    }
+    __syncthreads();
+
+    auto const* source_row_ptr = input_v + source_row * num_elems_in_col;
+    for (int64_t elem_index = threadIdx.x; elem_index < num_elems_in_col;
+         elem_index += EXPAND_THREADS_PER_BLOCK) {
+      auto const in_vec = source_row_ptr[elem_index];
+      CUTLASS_PRAGMA_UNROLL
+      for (int k_idx = 0; k_idx < EXPAND_SCATTER_MAX_K; ++k_idx) {
+        if (k_idx >= k) {
+          break;
+        }
+        int const permuted_row = permuted_rows[k_idx];
+        if (permuted_row >= 0) {
+          output_v[static_cast<int64_t>(permuted_row) * num_elems_in_col + elem_index] = in_vec;
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
 
 template <class InputActivationsType, class ExpandedActivationsType,
           TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType,
@@ -1606,9 +2171,11 @@ template <class InputActivationsType, class ExpandedActivationsType>
 void expandInputRowsKernelLauncher(
     InputActivationsType const* unpermuted_input, ExpandedActivationsType* permuted_output,
     float const* unpermuted_scales, float* permuted_scales,
-    int const* permuted_row_to_unpermuted_row, int64_t const num_rows, int64_t const hidden_size,
-    int const k, int const num_experts_per_node, QuantParams const& quant_params,
-    bool use_per_expert_act_scale, int64_t* expert_first_token_offset,
+    int const* permuted_row_to_unpermuted_row, int const* unpermuted_row_to_permuted_row,
+    int const* token_selected_experts, int64_t const num_rows, int64_t const hidden_size,
+    int const k, int const num_experts_per_node, int const start_expert_id,
+    QuantParams const& quant_params, bool use_per_expert_act_scale,
+    int64_t* expert_first_token_offset,
     TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
     TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, bool const swizzled_input_sf,
     void const* prequant_scales, bool enable_pdl, cudaStream_t stream) {
@@ -1625,6 +2192,32 @@ void expandInputRowsKernelLauncher(
   // tokens_to_expert), so the grid is driven purely by the expanded token count.
   int64_t const blocks = std::min(smCount * 8, std::max(num_rows * k, int64_t{1}));
   int64_t const threads = EXPAND_THREADS_PER_BLOCK;
+
+  if constexpr (std::is_same_v<InputActivationsType, ExpandedActivationsType> &&
+                std::is_same_v<InputActivationsType, __nv_bfloat16>) {
+    constexpr int64_t ScatterElemsPerThread = 128 / sizeof_bits<InputActivationsType>::value;
+    bool const use_scatter_expand =
+        prequant_scales == nullptr && !use_per_expert_act_scale &&
+        unpermuted_row_to_permuted_row != nullptr && token_selected_experts != nullptr && k > 1 &&
+        k <= EXPAND_SCATTER_MAX_K && num_rows >= 32768 && hidden_size % ScatterElemsPerThread == 0;
+    if (use_scatter_expand) {
+      cudaLaunchConfig_t config;
+      config.gridDim = std::min(smCount * 8, std::max(num_rows, int64_t{1}));
+      config.blockDim = threads;
+      config.dynamicSmemBytes = 0;
+      config.stream = stream;
+      cudaLaunchAttribute attrs[1];
+      attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+      config.numAttrs = 1;
+      config.attrs = attrs;
+      cudaLaunchKernelEx(&config, &expandInputRowsScatterKernel<InputActivationsType>,
+                         unpermuted_input, permuted_output, unpermuted_scales, permuted_scales,
+                         unpermuted_row_to_permuted_row, token_selected_experts, num_rows,
+                         hidden_size, k, num_experts_per_node, start_expert_id);
+      return;
+    }
+  }
 
   auto func = [&]() {
 #ifdef ENABLE_FP8
@@ -1701,8 +2294,9 @@ void expandInputRowsKernelLauncher(
   template void expandInputRowsKernelLauncher<InputActivationsType, ExpandedActivationsType>(      \
       InputActivationsType const* unpermuted_input, ExpandedActivationsType* permuted_output,      \
       float const* unpermuted_scales, float* permuted_scales,                                      \
-      int const* permuted_row_to_unpermuted_row, int64_t const num_rows,                           \
-      int64_t const hidden_size, int const k, int const num_experts_per_node,                      \
+      int const* permuted_row_to_unpermuted_row, int const* unpermuted_row_to_permuted_row,        \
+      int const* token_selected_experts, int64_t const num_rows, int64_t const hidden_size,        \
+      int const k, int const num_experts_per_node, int const start_expert_id,                      \
       QuantParams const& quant_params, bool use_per_expert_act_scale,                              \
       int64_t* expert_first_token_offset,                                                          \
       TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,                              \
@@ -1739,6 +2333,8 @@ __global__ void finalizeMoeRoutingKernel(
   int64_t const num_rows = gridDim.x;
   auto const offset = original_row * unpadded_cols;
   OutputType* reduced_row_ptr = reduced_unpermuted_output + offset;
+  (void)num_experts_per_node;
+  (void)start_expert_id;
 
   // Load 128-bits per thread, according to the smallest data type we read/write
   constexpr int64_t FINALIZE_ELEM_PER_THREAD =
@@ -1965,6 +2561,691 @@ void finalizeMoeRoutingKernelLauncher(
   }
 }
 
+template <typename OutputType, class GemmOutputType, class ScaleBiasType, ScaleMode SCALE_MODE>
+__global__ void finalizeMoeRoutingWithLoraKernel(
+    GemmOutputType const* expanded_permuted_rows, ScaleBiasType const* expanded_lora_rows,
+    int32_t const* expanded_lora_ranks, OutputType* reduced_unpermuted_output,
+    ScaleBiasType const* bias, float const* scales, int const* unpermuted_row_to_permuted_row,
+    int const* token_selected_experts, int64_t const padded_cols, int64_t const unpadded_cols,
+    int64_t const experts_per_token, int const num_experts_per_node, int const start_expert_id) {
+  assert(padded_cols % 4 == 0);
+  assert(unpadded_cols % 4 == 0);
+  assert(unpadded_cols <= padded_cols);
+  int64_t const original_row = blockIdx.x;
+  int64_t const num_rows = gridDim.x;
+  auto const offset = original_row * unpadded_cols;
+  OutputType* reduced_row_ptr = reduced_unpermuted_output + offset;
+
+  constexpr int64_t FINALIZE_ELEM_PER_THREAD =
+      128 / std::min(sizeof_bits<OutputType>::value, sizeof_bits<GemmOutputType>::value);
+
+  int64_t const start_offset = threadIdx.x;
+  int64_t const stride = FINALIZE_THREADS_PER_BLOCK;
+  int64_t const num_elems_in_padded_col = padded_cols / FINALIZE_ELEM_PER_THREAD;
+  int64_t const num_elems_in_orig_col = unpadded_cols / FINALIZE_ELEM_PER_THREAD;
+
+  using BiasElem = cutlass::Array<ScaleBiasType, FINALIZE_ELEM_PER_THREAD>;
+  using InputElem = cutlass::Array<GemmOutputType, FINALIZE_ELEM_PER_THREAD>;
+  using OutputElem = cutlass::Array<OutputType, FINALIZE_ELEM_PER_THREAD>;
+  using ComputeElem = cutlass::Array<float, FINALIZE_ELEM_PER_THREAD>;
+  auto const* bias_v = reinterpret_cast<BiasElem const*>(bias);
+  auto const* expanded_permuted_rows_v = reinterpret_cast<InputElem const*>(expanded_permuted_rows);
+  auto const* expanded_lora_rows_v = reinterpret_cast<BiasElem const*>(expanded_lora_rows);
+  auto* reduced_row_ptr_v = reinterpret_cast<OutputElem*>(reduced_row_ptr);
+
+  constexpr int kMaxCachedExpertsPerToken = 16;
+  __shared__ int64_t cached_permuted_rows[kMaxCachedExpertsPerToken];
+  __shared__ int cached_expert_ids[kMaxCachedExpertsPerToken];
+  __shared__ int cached_has_lora[kMaxCachedExpertsPerToken];
+  __shared__ float cached_scales[kMaxCachedExpertsPerToken];
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
+
+  bool const use_cached_routes = experts_per_token <= kMaxCachedExpertsPerToken;
+  if (use_cached_routes) {
+    int64_t const expanded_rows = num_rows * experts_per_token;
+    for (int k_idx = threadIdx.x; k_idx < experts_per_token; k_idx += blockDim.x) {
+      int64_t const k_offset = original_row * experts_per_token + k_idx;
+      int const expert_id = token_selected_experts[k_offset] - start_expert_id;
+      int64_t expanded_permuted_row = -1;
+      int has_lora = 0;
+      if (expert_id >= 0 && expert_id < num_experts_per_node) {
+        int64_t const expanded_original_row = original_row + k_idx * num_rows;
+        expanded_permuted_row = unpermuted_row_to_permuted_row[expanded_original_row];
+        if (expanded_permuted_row < 0 || expanded_permuted_row >= expanded_rows) {
+          expanded_permuted_row = -1;
+        } else if (expanded_lora_rows && expanded_lora_ranks &&
+                   expanded_lora_ranks[expanded_permuted_row] > 0) {
+          has_lora = 1;
+        }
+      }
+      cached_permuted_rows[k_idx] = expanded_permuted_row;
+      cached_expert_ids[k_idx] = expert_id;
+      cached_has_lora[k_idx] = has_lora;
+      cached_scales[k_idx] = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
+    }
+    __syncthreads();
+  }
+
+#pragma unroll
+  for (int elem_index = start_offset; elem_index < num_elems_in_orig_col; elem_index += stride) {
+    ComputeElem thread_output;
+    thread_output.fill(0);
+    for (int k_idx = 0; k_idx < experts_per_token; ++k_idx) {
+      int64_t expanded_permuted_row;
+      int expert_id;
+      int has_lora;
+      float row_scale;
+      if (use_cached_routes) {
+        expanded_permuted_row = cached_permuted_rows[k_idx];
+        expert_id = cached_expert_ids[k_idx];
+        has_lora = cached_has_lora[k_idx];
+        row_scale = cached_scales[k_idx];
+        if (expanded_permuted_row < 0) {
+          continue;
+        }
+      } else {
+        int64_t const k_offset = original_row * experts_per_token + k_idx;
+        expert_id = token_selected_experts[k_offset] - start_expert_id;
+        if (expert_id < 0 || expert_id >= num_experts_per_node) {
+          continue;
+        }
+
+        int64_t const expanded_original_row = original_row + k_idx * num_rows;
+        expanded_permuted_row = unpermuted_row_to_permuted_row[expanded_original_row];
+
+        int64_t const expanded_rows = num_rows * experts_per_token;
+        if (expanded_permuted_row < 0 || expanded_permuted_row >= expanded_rows) {
+          continue;
+        }
+
+        row_scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
+        has_lora = expanded_lora_rows && expanded_lora_ranks &&
+                   expanded_lora_ranks[expanded_permuted_row] > 0;
+      }
+
+      auto const* expanded_permuted_rows_row_ptr =
+          expanded_permuted_rows_v + expanded_permuted_row * num_elems_in_padded_col;
+
+      ComputeElem expert_result =
+          arrayConvert<InputElem, ComputeElem>(expanded_permuted_rows_row_ptr[elem_index]);
+      if (has_lora) {
+        auto const* expanded_lora_rows_row_ptr =
+            expanded_lora_rows_v + expanded_permuted_row * num_elems_in_padded_col;
+        expert_result = expert_result +
+                        arrayConvert<BiasElem, ComputeElem>(expanded_lora_rows_row_ptr[elem_index]);
+      }
+      if (bias) {
+        auto const* bias_ptr = bias_v + expert_id * num_elems_in_padded_col;
+        expert_result = expert_result + arrayConvert<BiasElem, ComputeElem>(bias_ptr[elem_index]);
+      }
+
+      thread_output = thread_output + row_scale * expert_result;
+    }
+
+    OutputElem output_elem = arrayConvert<ComputeElem, OutputElem>(thread_output);
+    reduced_row_ptr_v[elem_index] = output_elem;
+  }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+template <class OutputType, class GemmOutputType, class ScaleBiasType>
+void finalizeMoeRoutingWithLoraKernelLauncher(
+    GemmOutputType const* expanded_permuted_rows, ScaleBiasType const* expanded_lora_rows,
+    int32_t const* expanded_lora_ranks, OutputType* reduced_unpermuted_output,
+    ScaleBiasType const* bias, float const* final_scales, int const* unpermuted_row_to_permuted_row,
+    int const* token_selected_experts, int64_t const num_rows, int64_t const padded_cols,
+    int64_t const unpadded_cols, int64_t const experts_per_token,
+    int64_t const num_experts_per_node, MOEParallelismConfig parallelism_config, bool enable_pdl,
+    cudaStream_t stream) {
+  TLLM_CHECK_WITH_INFO(parallelism_config.ep_size == 1,
+                       "LoRA finalize fusion does not support expert parallelism");
+  ScaleBiasType const* bias_ptr = parallelism_config.tp_rank == 0 ? bias : nullptr;
+  int const start_expert_id = num_experts_per_node * parallelism_config.ep_rank;
+
+  cudaLaunchConfig_t config;
+  config.gridDim = num_rows;
+  config.blockDim = FINALIZE_THREADS_PER_BLOCK;
+  config.dynamicSmemBytes = 0;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+  config.numAttrs = 1;
+  config.attrs = attrs;
+
+  auto func = final_scales ? &finalizeMoeRoutingWithLoraKernel<OutputType, GemmOutputType,
+                                                               ScaleBiasType, ScaleMode::DEFAULT>
+                           : &finalizeMoeRoutingWithLoraKernel<OutputType, GemmOutputType,
+                                                               ScaleBiasType, ScaleMode::NO_SCALE>;
+  cudaLaunchKernelEx(&config, func, expanded_permuted_rows, expanded_lora_rows, expanded_lora_ranks,
+                     reduced_unpermuted_output, bias_ptr, final_scales,
+                     unpermuted_row_to_permuted_row, token_selected_experts, padded_cols,
+                     unpadded_cols, experts_per_token, num_experts_per_node, start_expert_id);
+}
+
+template <typename OutputType, class GemmOutputType, class ScaleBiasType, typename TokenIndexT,
+          ScaleMode SCALE_MODE, bool kUsePdl>
+__global__ void finalizeMoeRoutingWithTokenLoraKernel(
+    GemmOutputType const* expanded_permuted_rows, ScaleBiasType const* expanded_lora_rows,
+    OutputType* reduced_unpermuted_output, float const* scales,
+    int const* unpermuted_row_to_permuted_row, int const* token_selected_experts,
+    TokenIndexT const* token_lora_indices, int32_t const* adapter_lora_ranks,
+    void const* const* adapter_lora_weight_ptrs, int64_t const padded_cols,
+    int64_t const unpadded_cols, int64_t const experts_per_token, int const num_experts_per_node,
+    int const start_expert_id, int const num_lora_adapters, int64_t const col_begin,
+    int64_t const col_end) {
+  assert(padded_cols % 4 == 0);
+  assert(unpadded_cols % 4 == 0);
+  assert(unpadded_cols <= padded_cols);
+  int64_t const original_row = blockIdx.x;
+  int64_t const num_rows = gridDim.x;
+  auto const offset = original_row * unpadded_cols;
+  OutputType* reduced_row_ptr = reduced_unpermuted_output + offset;
+
+  constexpr int64_t FINALIZE_ELEM_PER_THREAD =
+      128 / std::min(sizeof_bits<OutputType>::value, sizeof_bits<GemmOutputType>::value);
+
+  int64_t const start_offset = threadIdx.x;
+  int64_t const stride = FINALIZE_THREADS_PER_BLOCK;
+  int64_t const num_elems_in_padded_col = padded_cols / FINALIZE_ELEM_PER_THREAD;
+  int64_t const num_elems_in_orig_col = unpadded_cols / FINALIZE_ELEM_PER_THREAD;
+  int64_t const slice_col_begin = col_begin > 0 ? col_begin : 0;
+  int64_t const slice_col_end =
+      col_end > 0 ? (col_end < unpadded_cols ? col_end : unpadded_cols) : unpadded_cols;
+  int64_t const elem_begin = slice_col_begin / FINALIZE_ELEM_PER_THREAD;
+  int64_t const elem_end = slice_col_end / FINALIZE_ELEM_PER_THREAD;
+  int64_t const elem_limit = elem_end < num_elems_in_orig_col ? elem_end : num_elems_in_orig_col;
+
+  using InputElem = cutlass::Array<GemmOutputType, FINALIZE_ELEM_PER_THREAD>;
+  using LoraElem = cutlass::Array<ScaleBiasType, FINALIZE_ELEM_PER_THREAD>;
+  using OutputElem = cutlass::Array<OutputType, FINALIZE_ELEM_PER_THREAD>;
+  using ComputeElem = cutlass::Array<float, FINALIZE_ELEM_PER_THREAD>;
+  auto const* expanded_permuted_rows_v = reinterpret_cast<InputElem const*>(expanded_permuted_rows);
+  auto const* expanded_lora_rows_v = reinterpret_cast<LoraElem const*>(expanded_lora_rows);
+  auto* reduced_row_ptr_v = reinterpret_cast<OutputElem*>(reduced_row_ptr);
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  if constexpr (kUsePdl) {
+    cudaGridDependencySynchronize();
+  }
+#endif
+
+  constexpr int kMaxCachedExpertsPerToken = 16;
+  __shared__ int cached_token_has_lora;
+  __shared__ int64_t cached_permuted_rows[kMaxCachedExpertsPerToken];
+  __shared__ float cached_scales[kMaxCachedExpertsPerToken];
+  int64_t const expanded_rows = num_rows * experts_per_token;
+  bool const use_cached_routes = experts_per_token <= kMaxCachedExpertsPerToken;
+  bool token_has_lora = false;
+  if (use_cached_routes) {
+    if (threadIdx.x == 0) {
+      int has_lora = 0;
+      int64_t const raw_lora_idx = static_cast<int64_t>(token_lora_indices[original_row]);
+      if (raw_lora_idx >= 0 && raw_lora_idx < num_lora_adapters) {
+        int const adapter = static_cast<int>(raw_lora_idx);
+        int32_t const raw_rank = adapter_lora_ranks[adapter];
+        auto const* lora_a = adapter_lora_weight_ptrs[adapter * 2];
+        auto const* lora_b = adapter_lora_weight_ptrs[adapter * 2 + 1];
+        has_lora = raw_rank > 0 && lora_a != nullptr && lora_b != nullptr;
+      }
+      cached_token_has_lora = has_lora;
+    }
+    for (int k_idx = threadIdx.x; k_idx < experts_per_token; k_idx += blockDim.x) {
+      int64_t const k_offset = original_row * experts_per_token + k_idx;
+      int const expert_id = token_selected_experts[k_offset] - start_expert_id;
+      int64_t expanded_permuted_row = -1;
+      if (expert_id >= 0 && expert_id < num_experts_per_node) {
+        int64_t const expanded_original_row = original_row + k_idx * num_rows;
+        expanded_permuted_row = unpermuted_row_to_permuted_row[expanded_original_row];
+        if (expanded_permuted_row < 0 || expanded_permuted_row >= expanded_rows) {
+          expanded_permuted_row = -1;
+        }
+      }
+      cached_permuted_rows[k_idx] = expanded_permuted_row;
+      cached_scales[k_idx] = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
+    }
+    __syncthreads();
+    token_has_lora = cached_token_has_lora != 0;
+  } else {
+    int64_t const raw_lora_idx = static_cast<int64_t>(token_lora_indices[original_row]);
+    if (raw_lora_idx >= 0 && raw_lora_idx < num_lora_adapters) {
+      int const adapter = static_cast<int>(raw_lora_idx);
+      int32_t const raw_rank = adapter_lora_ranks[adapter];
+      auto const* lora_a = adapter_lora_weight_ptrs[adapter * 2];
+      auto const* lora_b = adapter_lora_weight_ptrs[adapter * 2 + 1];
+      token_has_lora = raw_rank > 0 && lora_a != nullptr && lora_b != nullptr;
+    }
+  }
+
+#pragma unroll
+  for (int elem_index = elem_begin + start_offset; elem_index < elem_limit; elem_index += stride) {
+    ComputeElem thread_output;
+    thread_output.fill(0);
+    for (int k_idx = 0; k_idx < experts_per_token; ++k_idx) {
+      int64_t expanded_permuted_row;
+      float row_scale;
+      if (use_cached_routes) {
+        expanded_permuted_row = cached_permuted_rows[k_idx];
+        if (expanded_permuted_row < 0) {
+          continue;
+        }
+        row_scale = cached_scales[k_idx];
+      } else {
+        int64_t const k_offset = original_row * experts_per_token + k_idx;
+        int const expert_id = token_selected_experts[k_offset] - start_expert_id;
+        if (expert_id < 0 || expert_id >= num_experts_per_node) {
+          continue;
+        }
+
+        int64_t const expanded_original_row = original_row + k_idx * num_rows;
+        expanded_permuted_row = unpermuted_row_to_permuted_row[expanded_original_row];
+        if (expanded_permuted_row < 0 || expanded_permuted_row >= expanded_rows) {
+          continue;
+        }
+        row_scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
+      }
+
+      auto const* expanded_permuted_rows_row_ptr =
+          expanded_permuted_rows_v + expanded_permuted_row * num_elems_in_padded_col;
+      ComputeElem expert_result =
+          arrayConvert<InputElem, ComputeElem>(expanded_permuted_rows_row_ptr[elem_index]);
+      if (token_has_lora) {
+        auto const* expanded_lora_rows_row_ptr =
+            expanded_lora_rows_v + expanded_permuted_row * num_elems_in_padded_col;
+        expert_result = expert_result +
+                        arrayConvert<LoraElem, ComputeElem>(expanded_lora_rows_row_ptr[elem_index]);
+      }
+      thread_output = thread_output + row_scale * expert_result;
+    }
+
+    OutputElem output_elem = arrayConvert<ComputeElem, OutputElem>(thread_output);
+    reduced_row_ptr_v[elem_index] = output_elem;
+  }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  if constexpr (kUsePdl) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+#endif
+}
+
+template <typename TokenIndexT, int kThreads, int kElemPerThread, bool kTrustLoraMetadata,
+          bool kUsePdl>
+__global__ void finalizeMoeRoutingWithTokenLoraBf16Top8Kernel(
+    __nv_bfloat16 const* expanded_permuted_rows, __nv_bfloat16 const* expanded_lora_rows,
+    __nv_bfloat16* reduced_unpermuted_output, float const* scales,
+    int const* unpermuted_row_to_permuted_row, int const* token_selected_experts,
+    TokenIndexT const* token_lora_indices, int32_t const* adapter_lora_ranks,
+    void const* const* adapter_lora_weight_ptrs, int const num_lora_adapters) {
+  static_assert(kElemPerThread == 8 || kElemPerThread == 16);
+  constexpr int64_t kHiddenSize = 6144;
+  constexpr int kExpertsPerToken = 8;
+  constexpr int kNumExpertsPerNode = 256;
+  constexpr int64_t kVecs = kHiddenSize / kElemPerThread;
+
+  int64_t const original_row = blockIdx.x;
+  int64_t const num_rows = gridDim.x;
+  int64_t const expanded_rows = num_rows * kExpertsPerToken;
+
+  using Elem = cutlass::Array<__nv_bfloat16, kElemPerThread>;
+  using ComputeElem = cutlass::Array<float, kElemPerThread>;
+  auto const* expanded_permuted_rows_v = reinterpret_cast<Elem const*>(expanded_permuted_rows);
+  auto const* expanded_lora_rows_v = reinterpret_cast<Elem const*>(expanded_lora_rows);
+  auto* output_v = reinterpret_cast<Elem*>(reduced_unpermuted_output + original_row * kHiddenSize);
+
+  __shared__ int64_t cached_permuted_rows[kExpertsPerToken];
+  __shared__ float cached_scales[kExpertsPerToken];
+  __shared__ int cached_token_has_lora;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  if constexpr (kUsePdl) {
+    cudaGridDependencySynchronize();
+  }
+#endif
+
+  if (threadIdx.x == 0) {
+    int has_lora = 0;
+    int64_t const raw_lora_idx = static_cast<int64_t>(token_lora_indices[original_row]);
+    if (raw_lora_idx >= 0 && raw_lora_idx < num_lora_adapters) {
+      if constexpr (kTrustLoraMetadata) {
+        has_lora = 1;
+      } else {
+        int const adapter = static_cast<int>(raw_lora_idx);
+        int32_t const raw_rank = adapter_lora_ranks[adapter];
+        auto const* lora_a = adapter_lora_weight_ptrs[adapter * 2];
+        auto const* lora_b = adapter_lora_weight_ptrs[adapter * 2 + 1];
+        has_lora = raw_rank > 0 && lora_a != nullptr && lora_b != nullptr;
+      }
+    }
+    cached_token_has_lora = has_lora;
+  }
+
+  for (int k_idx = threadIdx.x; k_idx < kExpertsPerToken; k_idx += kThreads) {
+    int64_t const k_offset = original_row * kExpertsPerToken + k_idx;
+    int const expert_id = token_selected_experts[k_offset];
+    int64_t expanded_permuted_row = -1;
+    if (expert_id >= 0 && expert_id < kNumExpertsPerNode) {
+      int64_t const expanded_original_row = original_row + k_idx * num_rows;
+      expanded_permuted_row = unpermuted_row_to_permuted_row[expanded_original_row];
+      if (expanded_permuted_row < 0 || expanded_permuted_row >= expanded_rows) {
+        expanded_permuted_row = -1;
+      }
+    }
+    cached_permuted_rows[k_idx] = expanded_permuted_row;
+    cached_scales[k_idx] = scales[k_offset];
+  }
+  __syncthreads();
+
+  bool const token_has_lora = cached_token_has_lora != 0;
+#pragma unroll
+  for (int64_t elem_index = threadIdx.x; elem_index < kVecs; elem_index += kThreads) {
+    ComputeElem thread_output;
+    thread_output.fill(0);
+#pragma unroll
+    for (int k_idx = 0; k_idx < kExpertsPerToken; ++k_idx) {
+      int64_t const expanded_permuted_row = cached_permuted_rows[k_idx];
+      if (expanded_permuted_row < 0) {
+        continue;
+      }
+      auto const* expanded_permuted_rows_row_ptr =
+          expanded_permuted_rows_v + expanded_permuted_row * kVecs;
+      ComputeElem expert_result =
+          arrayConvert<Elem, ComputeElem>(expanded_permuted_rows_row_ptr[elem_index]);
+      if (token_has_lora) {
+        auto const* expanded_lora_rows_row_ptr =
+            expanded_lora_rows_v + expanded_permuted_row * kVecs;
+        expert_result =
+            expert_result + arrayConvert<Elem, ComputeElem>(expanded_lora_rows_row_ptr[elem_index]);
+      }
+      thread_output = thread_output + cached_scales[k_idx] * expert_result;
+    }
+    output_v[elem_index] = arrayConvert<ComputeElem, Elem>(thread_output);
+  }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  if constexpr (kUsePdl) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+#endif
+}
+
+template <typename TokenIndexT, int kThreads, int kElemPerThread, bool kTrustLoraMetadata>
+void launchFinalizeMoeRoutingWithTokenLoraBf16Top8(
+    __nv_bfloat16 const* expanded_permuted_rows, __nv_bfloat16 const* expanded_lora_rows,
+    __nv_bfloat16* reduced_unpermuted_output, float const* final_scales,
+    int const* unpermuted_row_to_permuted_row, int const* token_selected_experts,
+    TokenIndexT const* token_lora_indices, int32_t const* adapter_lora_ranks,
+    void const* const* adapter_lora_weight_ptrs, int64_t const num_rows,
+    int const num_lora_adapters, bool enable_pdl, cudaStream_t stream) {
+  cudaLaunchConfig_t config;
+  config.dynamicSmemBytes = 0;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+  config.numAttrs = 1;
+  config.attrs = attrs;
+  config.gridDim = num_rows;
+  config.blockDim = kThreads;
+  auto func =
+      enable_pdl
+          ? &finalizeMoeRoutingWithTokenLoraBf16Top8Kernel<TokenIndexT, kThreads, kElemPerThread,
+                                                           kTrustLoraMetadata, true>
+          : &finalizeMoeRoutingWithTokenLoraBf16Top8Kernel<TokenIndexT, kThreads, kElemPerThread,
+                                                           kTrustLoraMetadata, false>;
+  cudaLaunchKernelEx(&config, func, expanded_permuted_rows, expanded_lora_rows,
+                     reduced_unpermuted_output, final_scales, unpermuted_row_to_permuted_row,
+                     token_selected_experts, token_lora_indices, adapter_lora_ranks,
+                     adapter_lora_weight_ptrs, num_lora_adapters);
+}
+
+template <class OutputType, class GemmOutputType, class ScaleBiasType, typename TokenIndexT>
+bool maybeLaunchFinalizeMoeRoutingWithTokenLoraFastPath(
+    GemmOutputType const* expanded_permuted_rows, ScaleBiasType const* expanded_lora_rows,
+    OutputType* reduced_unpermuted_output, float const* final_scales,
+    int const* unpermuted_row_to_permuted_row, int const* token_selected_experts,
+    TokenIndexT const* token_lora_indices, int32_t const* adapter_lora_ranks,
+    void const* const* adapter_lora_weight_ptrs, int64_t const num_rows, int64_t const padded_cols,
+    int64_t const unpadded_cols, int64_t const experts_per_token,
+    int64_t const num_experts_per_node, MOEParallelismConfig parallelism_config,
+    int const num_lora_adapters, bool enable_pdl, cudaStream_t stream) {
+  if constexpr (std::is_same_v<OutputType, __nv_bfloat16> &&
+                std::is_same_v<GemmOutputType, __nv_bfloat16> &&
+                std::is_same_v<ScaleBiasType, __nv_bfloat16>) {
+    if (final_scales == nullptr || padded_cols != 6144 || unpadded_cols != 6144 ||
+        experts_per_token != 8 || num_experts_per_node != 256 || parallelism_config.ep_size != 1 ||
+        parallelism_config.ep_rank != 0 || num_lora_adapters <= 0) {
+      return false;
+    }
+    if (enable_pdl) {
+      return false;
+    }
+    auto const* base = reinterpret_cast<__nv_bfloat16 const*>(expanded_permuted_rows);
+    auto const* lora = reinterpret_cast<__nv_bfloat16 const*>(expanded_lora_rows);
+    auto* output = reinterpret_cast<__nv_bfloat16*>(reduced_unpermuted_output);
+    launchFinalizeMoeRoutingWithTokenLoraBf16Top8<TokenIndexT, 256, 8, false>(
+        base, lora, output, final_scales, unpermuted_row_to_permuted_row, token_selected_experts,
+        token_lora_indices, adapter_lora_ranks, adapter_lora_weight_ptrs, num_rows,
+        num_lora_adapters, enable_pdl, stream);
+    return true;
+  }
+  return false;
+}
+
+template <class OutputType, class GemmOutputType, class ScaleBiasType, typename TokenIndexT>
+void finalizeMoeRoutingWithTokenLoraKernelLauncher(
+    GemmOutputType const* expanded_permuted_rows, ScaleBiasType const* expanded_lora_rows,
+    OutputType* reduced_unpermuted_output, float const* final_scales,
+    int const* unpermuted_row_to_permuted_row, int const* token_selected_experts,
+    TokenIndexT const* token_lora_indices, int32_t const* adapter_lora_ranks,
+    void const* const* adapter_lora_weight_ptrs, int64_t const num_rows, int64_t const padded_cols,
+    int64_t const unpadded_cols, int64_t const experts_per_token,
+    int64_t const num_experts_per_node, MOEParallelismConfig parallelism_config,
+    int const num_lora_adapters, bool enable_pdl, cudaStream_t stream, int64_t const col_begin = 0,
+    int64_t const col_end = -1) {
+  TLLM_CHECK_WITH_INFO(parallelism_config.ep_size == 1,
+                       "LoRA token finalize fusion does not support expert parallelism");
+  int const start_expert_id = num_experts_per_node * parallelism_config.ep_rank;
+  if (start_expert_id == 0 &&
+      maybeLaunchFinalizeMoeRoutingWithTokenLoraFastPath(
+          expanded_permuted_rows, expanded_lora_rows, reduced_unpermuted_output, final_scales,
+          unpermuted_row_to_permuted_row, token_selected_experts, token_lora_indices,
+          adapter_lora_ranks, adapter_lora_weight_ptrs, num_rows, padded_cols, unpadded_cols,
+          experts_per_token, num_experts_per_node, parallelism_config, num_lora_adapters,
+          enable_pdl, stream)) {
+    return;
+  }
+
+  cudaLaunchConfig_t config;
+  config.dynamicSmemBytes = 0;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+  config.numAttrs = 1;
+  config.attrs = attrs;
+
+  config.gridDim = num_rows;
+  config.blockDim = FINALIZE_THREADS_PER_BLOCK;
+  auto func =
+      final_scales
+          ? (enable_pdl
+                 ? &finalizeMoeRoutingWithTokenLoraKernel<OutputType, GemmOutputType, ScaleBiasType,
+                                                          TokenIndexT, ScaleMode::DEFAULT, true>
+                 : &finalizeMoeRoutingWithTokenLoraKernel<OutputType, GemmOutputType, ScaleBiasType,
+                                                          TokenIndexT, ScaleMode::DEFAULT, false>)
+          : (enable_pdl
+                 ? &finalizeMoeRoutingWithTokenLoraKernel<OutputType, GemmOutputType, ScaleBiasType,
+                                                          TokenIndexT, ScaleMode::NO_SCALE, true>
+                 : &finalizeMoeRoutingWithTokenLoraKernel<OutputType, GemmOutputType, ScaleBiasType,
+                                                          TokenIndexT, ScaleMode::NO_SCALE, false>);
+  cudaLaunchKernelEx(&config, func, expanded_permuted_rows, expanded_lora_rows,
+                     reduced_unpermuted_output, final_scales, unpermuted_row_to_permuted_row,
+                     token_selected_experts, token_lora_indices, adapter_lora_ranks,
+                     adapter_lora_weight_ptrs, padded_cols, unpadded_cols, experts_per_token,
+                     num_experts_per_node, start_expert_id, num_lora_adapters, col_begin, col_end);
+}
+
+template <typename OutputType, class ScaleBiasType, ScaleMode SCALE_MODE>
+__global__ void addFinalizedLoraToOutputKernel(
+    ScaleBiasType const* expanded_lora_rows, int32_t const* expanded_lora_ranks,
+    OutputType* reduced_unpermuted_output, float const* scales,
+    int const* unpermuted_row_to_permuted_row, int const* token_selected_experts,
+    int64_t const padded_cols, int64_t const unpadded_cols, int64_t const experts_per_token,
+    int const num_experts_per_node, int const start_expert_id) {
+  assert(padded_cols % 4 == 0);
+  assert(unpadded_cols % 4 == 0);
+  assert(unpadded_cols <= padded_cols);
+  int64_t const original_row = blockIdx.x;
+  int64_t const num_rows = gridDim.x;
+  auto const offset = original_row * unpadded_cols;
+  OutputType* reduced_row_ptr = reduced_unpermuted_output + offset;
+
+  constexpr int64_t FINALIZE_ELEM_PER_THREAD =
+      128 / std::min(sizeof_bits<OutputType>::value, sizeof_bits<ScaleBiasType>::value);
+
+  int64_t const start_offset = threadIdx.x;
+  int64_t const stride = FINALIZE_THREADS_PER_BLOCK;
+  int64_t const num_elems_in_padded_col = padded_cols / FINALIZE_ELEM_PER_THREAD;
+  int64_t const num_elems_in_orig_col = unpadded_cols / FINALIZE_ELEM_PER_THREAD;
+
+  using LoraElem = cutlass::Array<ScaleBiasType, FINALIZE_ELEM_PER_THREAD>;
+  using OutputElem = cutlass::Array<OutputType, FINALIZE_ELEM_PER_THREAD>;
+  using ComputeElem = cutlass::Array<float, FINALIZE_ELEM_PER_THREAD>;
+  auto const* expanded_lora_rows_v = reinterpret_cast<LoraElem const*>(expanded_lora_rows);
+  auto* reduced_row_ptr_v = reinterpret_cast<OutputElem*>(reduced_row_ptr);
+
+  constexpr int kMaxCachedExpertsPerToken = 16;
+  __shared__ int64_t cached_permuted_rows[kMaxCachedExpertsPerToken];
+  __shared__ int cached_has_lora[kMaxCachedExpertsPerToken];
+  __shared__ float cached_scales[kMaxCachedExpertsPerToken];
+  __shared__ int cached_any_lora;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
+
+  bool const use_cached_routes = experts_per_token <= kMaxCachedExpertsPerToken;
+  if (use_cached_routes) {
+    if (threadIdx.x == 0) {
+      cached_any_lora = 0;
+    }
+    __syncthreads();
+
+    int64_t const expanded_rows = num_rows * experts_per_token;
+    for (int k_idx = threadIdx.x; k_idx < experts_per_token; k_idx += blockDim.x) {
+      int64_t const k_offset = original_row * experts_per_token + k_idx;
+      int const expert_id = token_selected_experts[k_offset] - start_expert_id;
+      int64_t expanded_permuted_row = -1;
+      int has_lora = 0;
+      if (expert_id >= 0 && expert_id < num_experts_per_node) {
+        int64_t const expanded_original_row = original_row + k_idx * num_rows;
+        expanded_permuted_row = unpermuted_row_to_permuted_row[expanded_original_row];
+        if (expanded_permuted_row < 0 || expanded_permuted_row >= expanded_rows) {
+          expanded_permuted_row = -1;
+        } else if (expanded_lora_ranks && expanded_lora_ranks[expanded_permuted_row] > 0) {
+          has_lora = 1;
+          atomicOr(&cached_any_lora, 1);
+        }
+      }
+      cached_permuted_rows[k_idx] = expanded_permuted_row;
+      cached_has_lora[k_idx] = has_lora;
+      cached_scales[k_idx] = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
+    }
+    __syncthreads();
+    if (!cached_any_lora) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+      cudaTriggerProgrammaticLaunchCompletion();
+#endif
+      return;
+    }
+  }
+
+#pragma unroll
+  for (int elem_index = start_offset; elem_index < num_elems_in_orig_col; elem_index += stride) {
+    ComputeElem thread_output =
+        arrayConvert<OutputElem, ComputeElem>(reduced_row_ptr_v[elem_index]);
+    for (int k_idx = 0; k_idx < experts_per_token; ++k_idx) {
+      int64_t expanded_permuted_row;
+      int has_lora;
+      float row_scale;
+      if (use_cached_routes) {
+        expanded_permuted_row = cached_permuted_rows[k_idx];
+        has_lora = cached_has_lora[k_idx];
+        row_scale = cached_scales[k_idx];
+        if (expanded_permuted_row < 0 || !has_lora) {
+          continue;
+        }
+      } else {
+        int64_t const k_offset = original_row * experts_per_token + k_idx;
+        int const expert_id = token_selected_experts[k_offset] - start_expert_id;
+        if (expert_id < 0 || expert_id >= num_experts_per_node) {
+          continue;
+        }
+
+        int64_t const expanded_original_row = original_row + k_idx * num_rows;
+        expanded_permuted_row = unpermuted_row_to_permuted_row[expanded_original_row];
+
+        int64_t const expanded_rows = num_rows * experts_per_token;
+        if (expanded_permuted_row < 0 || expanded_permuted_row >= expanded_rows ||
+            expanded_lora_ranks[expanded_permuted_row] <= 0) {
+          continue;
+        }
+
+        row_scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
+      }
+
+      auto const* expanded_lora_rows_row_ptr =
+          expanded_lora_rows_v + expanded_permuted_row * num_elems_in_padded_col;
+      thread_output = thread_output + row_scale * arrayConvert<LoraElem, ComputeElem>(
+                                                      expanded_lora_rows_row_ptr[elem_index]);
+    }
+
+    OutputElem output_elem = arrayConvert<ComputeElem, OutputElem>(thread_output);
+    reduced_row_ptr_v[elem_index] = output_elem;
+  }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+template <class OutputType, class ScaleBiasType>
+void addFinalizedLoraToOutputKernelLauncher(
+    ScaleBiasType const* expanded_lora_rows, int32_t const* expanded_lora_ranks,
+    OutputType* reduced_unpermuted_output, float const* final_scales,
+    int const* unpermuted_row_to_permuted_row, int const* token_selected_experts,
+    int64_t const num_rows, int64_t const padded_cols, int64_t const unpadded_cols,
+    int64_t const experts_per_token, int64_t const num_experts_per_node,
+    MOEParallelismConfig parallelism_config, bool enable_pdl, cudaStream_t stream) {
+  TLLM_CHECK_WITH_INFO(parallelism_config.ep_size == 1,
+                       "LoRA finalize fusion does not support expert parallelism");
+  int const start_expert_id = num_experts_per_node * parallelism_config.ep_rank;
+
+  cudaLaunchConfig_t config;
+  config.gridDim = num_rows;
+  config.blockDim = FINALIZE_THREADS_PER_BLOCK;
+  config.dynamicSmemBytes = 0;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+  config.numAttrs = 1;
+  config.attrs = attrs;
+
+  auto func = final_scales
+                  ? &addFinalizedLoraToOutputKernel<OutputType, ScaleBiasType, ScaleMode::DEFAULT>
+                  : &addFinalizedLoraToOutputKernel<OutputType, ScaleBiasType, ScaleMode::NO_SCALE>;
+  cudaLaunchKernelEx(&config, func, expanded_lora_rows, expanded_lora_ranks,
+                     reduced_unpermuted_output, final_scales, unpermuted_row_to_permuted_row,
+                     token_selected_experts, padded_cols, unpadded_cols, experts_per_token,
+                     num_experts_per_node, start_expert_id);
+}
+
 #define INSTANTIATE_FINALIZE_MOE_ROUTING(OutputT, GemmOutputT, ScaleBiasT)                  \
   template void finalizeMoeRoutingKernelLauncher<OutputT, GemmOutputT, ScaleBiasT>(         \
       GemmOutputT const* expanded_permuted_rows, OutputT* reduced_unpermuted_output,        \
@@ -2117,7 +3398,7 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
     ScaleBiasType const* bias_ptr, bool bias_is_broadcast, int64_t const* expert_first_token_offset,
     int num_experts_per_node, int64_t inter_size, float const* fc2_act_global_scale,
     bool use_per_expert_act_scale, TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat,
-    ActivationParams activation_params) {
+    int32_t const* bias_row_ranks, ActivationParams activation_params) {
 #ifdef ENABLE_FP4
   constexpr bool IsNVFP4 =
       std::is_same_v<T, __nv_fp4_e2m1> &&
@@ -2161,14 +3442,16 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
   for (int64_t token = blockIdx.x; token < num_valid_tokens; token += gridDim.x) {
     size_t gemm_result_offset = token * inter_size * gated_size_mul;
     size_t output_offset = token * inter_size;
+    bool const row_has_bias = bias_ptr && (bias_row_ranks == nullptr || bias_row_ranks[token] > 0);
 
     int64_t expert = 0;
     float gate_alpha = 1.0f;
     float gate_beta = 0.0f;
     float gate_limit = std::numeric_limits<float>::infinity();
-    if (bias_ptr || IsNVFP4 || IsMXFP8 || use_per_expert_act_scale ||
-        activation_params.swiglu_alpha || activation_params.swiglu_beta ||
-        activation_params.swiglu_limit) {
+    bool const needs_expert = (row_has_bias && bias_is_broadcast) || IsNVFP4 || IsMXFP8 ||
+                              use_per_expert_act_scale || activation_params.swiglu_alpha ||
+                              activation_params.swiglu_beta || activation_params.swiglu_limit;
+    if (needs_expert) {
       // TODO this is almost certainly faster as a linear scan
       expert =
           findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node, token + 1) -
@@ -2188,7 +3471,7 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
     int64_t num_tokens_before_expert = (IsNVFP4 || IsMXFP8) ? expert_first_token_offset[expert] : 0;
 
     size_t bias_offset = 0;
-    if (bias_ptr) {
+    if (row_has_bias) {
       bias_offset = (bias_is_broadcast ? expert * inter_size * gated_size_mul : gemm_result_offset);
     }
 
@@ -2202,7 +3485,8 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
     auto gemm_result_vec =
         reinterpret_cast<GemmResultElem const*>(gemm_result + gemm_result_offset);
     auto output_vec = reinterpret_cast<OutputElem*>(safe_inc_ptr(output, output_offset));
-    auto bias_ptr_vec = reinterpret_cast<BiasElem const*>(bias_ptr + bias_offset);
+    auto bias_ptr_vec =
+        row_has_bias ? reinterpret_cast<BiasElem const*>(bias_ptr + bias_offset) : nullptr;
     int64_t const start_offset = tid;
     int64_t const stride = ACTIVATION_THREADS_PER_BLOCK;
     assert(inter_size % ACTIVATION_ELEM_PER_THREAD == 0);
@@ -2217,7 +3501,7 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
     for (int64_t elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
       auto fc1_value =
           arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index + gated_off_vec]);
-      if (bias_ptr) {
+      if (bias_ptr_vec) {
         fc1_value = fc1_value +
                     arrayConvert<BiasElem, ComputeElem>(bias_ptr_vec[elem_index + gated_off_vec]);
       }
@@ -2283,6 +3567,56 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
   // straddle the inter_size boundary within valid rows.
 }
 
+template <int kThreadsPerBlock>
+__global__ __launch_bounds__(kThreadsPerBlock) void doActivationSwigluBf16Kernel(
+    __nv_bfloat16* output, __nv_bfloat16 const* gemm_result, __nv_bfloat16 const* bias_ptr,
+    int64_t const* expert_first_token_offset, int num_experts_per_node, int64_t inter_size,
+    int32_t const* bias_row_ranks) {
+  int64_t const tid = threadIdx.x;
+  int64_t const num_valid_tokens = expert_first_token_offset[num_experts_per_node];
+  int64_t const inter_pairs = inter_size >> 1;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
+
+  for (int64_t token = blockIdx.x; token < num_valid_tokens; token += gridDim.x) {
+    bool const row_has_bias =
+        bias_ptr != nullptr && (bias_row_ranks == nullptr || bias_row_ranks[token] > 0);
+    int64_t const row_base = token * inter_size * 2;
+    auto const* linear_pairs = reinterpret_cast<__nv_bfloat162 const*>(gemm_result + row_base);
+    auto const* gate_pairs =
+        reinterpret_cast<__nv_bfloat162 const*>(gemm_result + row_base + inter_size);
+    auto* output_pairs = reinterpret_cast<__nv_bfloat162*>(output + token * inter_size);
+    auto const* bias_linear_pairs =
+        row_has_bias ? reinterpret_cast<__nv_bfloat162 const*>(bias_ptr + row_base) : nullptr;
+    auto const* bias_gate_pairs =
+        row_has_bias ? reinterpret_cast<__nv_bfloat162 const*>(bias_ptr + row_base + inter_size)
+                     : nullptr;
+
+    for (int64_t pair_idx = tid; pair_idx < inter_pairs; pair_idx += blockDim.x) {
+      float2 linear_value = __bfloat1622float2(linear_pairs[pair_idx]);
+      float2 gate_value = __bfloat1622float2(gate_pairs[pair_idx]);
+      if (row_has_bias) {
+        float2 const linear_bias = __bfloat1622float2(bias_linear_pairs[pair_idx]);
+        float2 const gate_bias = __bfloat1622float2(bias_gate_pairs[pair_idx]);
+        linear_value.x += linear_bias.x;
+        linear_value.y += linear_bias.y;
+        gate_value.x += gate_bias.x;
+        gate_value.y += gate_bias.y;
+      }
+
+      float const act0 = gate_value.x / (1.0f + expf(-gate_value.x));
+      float const act1 = gate_value.y / (1.0f + expf(-gate_value.y));
+      output_pairs[pair_idx] = __floats2bfloat162_rn(act0 * linear_value.x, act1 * linear_value.y);
+    }
+  }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
 template <class T, class GemmOutputType, class ScaleBiasType>
 void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8_quant,
                   ScaleBiasType const* bias, bool bias_is_broadcast,
@@ -2290,13 +3624,38 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                   int64_t inter_size, int64_t expanded_num_tokens, ActivationParams activation_type,
                   QuantParams const& quant_params, bool use_per_expert_act_scale,
                   TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat, bool enable_pdl,
-                  cudaStream_t stream) {
+                  cudaStream_t stream, int32_t const* bias_row_ranks = nullptr) {
   static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
   // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
   // N-dim SF padding has been removed (CUTLASS grouped GEMM never reads beyond
   // tokens_to_expert), so the grid is driven purely by the expanded token count.
-  int64_t const blocks = std::min(smCount * 8, std::max(expanded_num_tokens, int64_t{1}));
+  int64_t blocks = std::min(smCount * 8, std::max(expanded_num_tokens, int64_t{1}));
   int64_t const threads = ACTIVATION_THREADS_PER_BLOCK;
+
+  if constexpr (std::is_same_v<T, __nv_bfloat16> && std::is_same_v<GemmOutputType, __nv_bfloat16> &&
+                std::is_same_v<ScaleBiasType, __nv_bfloat16>) {
+    if (activation_type.activation_type == ActivationType::Swiglu && fp8_quant == nullptr &&
+        !bias_is_broadcast && !use_per_expert_act_scale && fc2_act_sf_flat == nullptr &&
+        activation_type.swiglu_alpha == nullptr && activation_type.swiglu_beta == nullptr &&
+        activation_type.swiglu_limit == nullptr && (inter_size % 2 == 0)) {
+      cudaLaunchConfig_t config;
+      config.gridDim = blocks;
+      config.blockDim = threads;
+      config.dynamicSmemBytes = 0;
+      config.stream = stream;
+      cudaLaunchAttribute attrs[1];
+      attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+      config.numAttrs = 1;
+      config.attrs = attrs;
+      cudaLaunchKernelEx(&config, doActivationSwigluBf16Kernel<ACTIVATION_THREADS_PER_BLOCK>,
+                         reinterpret_cast<__nv_bfloat16*>(output),
+                         reinterpret_cast<__nv_bfloat16 const*>(gemm_result),
+                         reinterpret_cast<__nv_bfloat16 const*>(bias), expert_first_token_offset,
+                         num_experts_per_node, inter_size, bias_row_ranks);
+      return;
+    }
+  }
 
   auto fn = [&]() {
     auto fn = [&](auto block_scaling_type, auto disableFP4QuantFastMathTag,
@@ -2382,7 +3741,7 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
   cudaLaunchKernelEx(&config, fn, output, gemm_result, fp8_quant, bias, bias_is_broadcast,
                      expert_first_token_offset, num_experts_per_node, inter_size,
                      quant_params.fp4.fc2.act_global_scale, use_per_expert_act_scale,
-                     fc2_act_sf_flat, activation_type);
+                     fc2_act_sf_flat, bias_row_ranks, activation_type);
 }
 
 // ============================== Lora Add Bias =================================
@@ -2561,9 +3920,37 @@ template <class T, class WeightType, class OutputType, class InputType, class Ba
           bool IsMXFPX, class Enable>
 CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
                    Enable>::CutlassMoeFCRunner()
-    : blockscale_gemm_runner_{
-          std::make_unique<kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunner<
-              __nv_bfloat16, __nv_fp8_e4m3, __nv_bfloat16>>()} {}
+#ifdef FAST_BUILD
+    : blockscale_gemm_runner_{nullptr}
+#else
+    : blockscale_gemm_runner_{std::make_unique<
+          kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunner<__nv_bfloat16, __nv_fp8_e4m3,
+                                                                       __nv_bfloat16>>()}
+#endif
+{
+  check_cuda_error(cudaStreamCreateWithFlags(&lora_stream_, cudaStreamNonBlocking));
+  check_cuda_error(cudaEventCreateWithFlags(&lora_start_event_, cudaEventDisableTiming));
+  check_cuda_error(cudaEventCreateWithFlags(&lora_ready_event_, cudaEventDisableTiming));
+  check_cuda_error(cudaEventCreateWithFlags(&lora_fc2_ready_event_, cudaEventDisableTiming));
+}
+
+template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
+          bool IsMXFPX, class Enable>
+CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
+                   Enable>::~CutlassMoeFCRunner() {
+  if (lora_ready_event_) {
+    (void)cudaEventDestroy(lora_ready_event_);
+  }
+  if (lora_fc2_ready_event_) {
+    (void)cudaEventDestroy(lora_fc2_ready_event_);
+  }
+  if (lora_start_event_) {
+    (void)cudaEventDestroy(lora_start_event_);
+  }
+  if (lora_stream_) {
+    (void)cudaStreamDestroy(lora_stream_);
+  }
+}
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
           bool IsMXFPX, class Enable>
@@ -3019,7 +4406,9 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
     int64_t const inter_size, int const num_experts_per_node, ActivationParams fc1_activation_type,
     float const** alpha_scale_ptr_array, bool bias_is_broadcast, cudaStream_t stream,
     cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
-    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl) {
+    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl,
+    cudaEvent_t pre_activation_event, int32_t const* fc1_lora_bias_ranks,
+    std::function<void()> const* pre_activation_work) {
   if (fp8_blockscale_gemm_runner) {
     TLLM_CHECK(!min_latency_mode);
     Self::BlockScaleFC1(*fp8_blockscale_gemm_runner, input, output, intermediate_result,
@@ -3089,7 +4478,16 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
                                                                 config};
     gemm_runner.moeGemm(universal_input, tma_ws_input);
 
+    if (pre_activation_work != nullptr) {
+      // Queue dependent LoRA work while GEMM1 is still running. In debug builds
+      // sync_check_cuda_error may synchronize the main stream, so launching this
+      // callback before the check is what preserves cross-stream overlap.
+      (*pre_activation_work)();
+    }
     sync_check_cuda_error(stream);
+    if (pre_activation_event != nullptr) {
+      check_cuda_error(cudaStreamWaitEvent(stream, pre_activation_event, 0));
+    }
 
     // TODO: when bias_is_broadcast is false, fuse bias to gemm
     using GatedActOutputType = std::conditional_t<use_w4afp8, BackBoneType, T>;
@@ -3104,7 +4502,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
         static_cast<UnfusedGemmOutputType const*>(gemm_output), fc2_fp8_quant, fc1_expert_biases,
         bias_is_broadcast, expert_first_token_offset, num_experts_per_node, inter_size,
         expanded_num_rows, fc1_activation_type, quant_params, use_per_expert_act_scale,
-        fc2_fp4_act_flat, enable_pdl, stream);
+        fc2_fp4_act_flat, enable_pdl, stream, fc1_lora_bias_ranks);
 
     sync_check_cuda_error(stream);
   } else if (use_fp8) {
@@ -3233,6 +4631,1295 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
   }
 }
 
+static __global__ void addLoraBiasRankAwareBf16x2ByRowKernel(
+    __nv_bfloat16* gemm_output, __nv_bfloat16 const* fc2_lora, int32_t const* fc2_lora_ranks,
+    int64_t const* expert_first_token_offset, int num_experts_per_node, int64_t hidden_size) {
+  int64_t const num_valid_tokens = expert_first_token_offset[num_experts_per_node];
+  int64_t const hidden_pairs = hidden_size / 2;
+
+  for (int64_t row = blockIdx.x; row < num_valid_tokens; row += gridDim.x) {
+    if (fc2_lora_ranks[row] <= 0) {
+      continue;
+    }
+
+    auto* output_pairs = reinterpret_cast<__nv_bfloat162*>(gemm_output + row * hidden_size);
+    auto const* lora_pairs = reinterpret_cast<__nv_bfloat162 const*>(fc2_lora + row * hidden_size);
+    for (int64_t col_pair = threadIdx.x; col_pair < hidden_pairs; col_pair += blockDim.x) {
+      float2 output_value = __bfloat1622float2(output_pairs[col_pair]);
+      float2 lora_value = __bfloat1622float2(lora_pairs[col_pair]);
+      output_pairs[col_pair] =
+          __floats2bfloat162_rn(output_value.x + lora_value.x, output_value.y + lora_value.y);
+    }
+  }
+}
+
+inline void addLoraBiasRankAwareBf16x2ByRow(__nv_bfloat16* gemm_output,
+                                            __nv_bfloat16 const* fc2_lora,
+                                            int32_t const* fc2_lora_ranks,
+                                            int64_t const* expert_first_token_offset,
+                                            int num_experts_per_node, int64_t expanded_num_rows,
+                                            int64_t hidden_size, cudaStream_t stream) {
+  constexpr int threads = 1024;
+  int const blocks =
+      static_cast<int>(std::min<int64_t>(std::max<int64_t>(expanded_num_rows, 1), 65535));
+  addLoraBiasRankAwareBf16x2ByRowKernel<<<blocks, threads, 0, stream>>>(
+      gemm_output, fc2_lora, fc2_lora_ranks, expert_first_token_offset, num_experts_per_node,
+      hidden_size);
+}
+
+template <bool AddToOutput>
+static __global__ void fc2LoraRank16Bf16GroupedOutputKernel(
+    __nv_bfloat16* output, __nv_bfloat16 const* low_rank_workspace,
+    int64_t const* expert_first_token_offset, int64_t out_hidden_size, int num_lora_adapters,
+    int32_t const* adapter_lora_ranks, void const* const* adapter_lora_weight_ptrs,
+    int32_t const* permuted_lora_indices, int32_t const* adapter_expert_row_counts,
+    int32_t const* adapter_expert_row_indices, int adapter_expert_row_capacity,
+    int32_t const* adapter_expert_row_starts, bool rows_grouped_by_adapter) {
+  int64_t const out_pair = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t const out_hidden_pairs = out_hidden_size >> 1;
+  int const adapter = static_cast<int>(blockIdx.y);
+  int const expert = static_cast<int>(blockIdx.z);
+  if (out_pair >= out_hidden_pairs || adapter >= num_lora_adapters) {
+    return;
+  }
+
+  bool const has_row_list = adapter_expert_row_counts != nullptr &&
+                            adapter_expert_row_indices != nullptr &&
+                            adapter_expert_row_capacity > 0;
+  bool use_row_list = false;
+  int row_count = 0;
+  int row_start = 0;
+  int32_t const* row_indices = nullptr;
+  if (has_row_list) {
+    int const bucket = expert * num_lora_adapters + adapter;
+    row_count = adapter_expert_row_counts[bucket];
+    if (row_count <= 0) {
+      return;
+    }
+    if (rows_grouped_by_adapter && adapter_expert_row_starts != nullptr) {
+      row_start = adapter_expert_row_starts[bucket];
+      if (row_start < 0) {
+        return;
+      }
+    } else if (row_count <= adapter_expert_row_capacity) {
+      use_row_list = true;
+      row_indices =
+          adapter_expert_row_indices + static_cast<int64_t>(bucket) * adapter_expert_row_capacity;
+    }
+  }
+
+  int32_t const raw_lora_rank = adapter_lora_ranks[adapter];
+  int const lora_rank = raw_lora_rank <= 0 ? 0 : (raw_lora_rank < 16 ? raw_lora_rank : 16);
+  if (lora_rank <= 0) {
+    return;
+  }
+
+  auto const* lora_b_base =
+      reinterpret_cast<__nv_bfloat16 const*>(adapter_lora_weight_ptrs[adapter * 2 + 1]);
+  if (lora_b_base == nullptr) {
+    return;
+  }
+  lora_b_base += static_cast<size_t>(expert) * static_cast<size_t>(out_hidden_size) * 16;
+
+  int64_t const out_idx = out_pair << 1;
+  auto const* lora_b_row0_pairs =
+      reinterpret_cast<__nv_bfloat162 const*>(lora_b_base + static_cast<size_t>(out_idx) * 16);
+  auto const* lora_b_row1_pairs =
+      reinterpret_cast<__nv_bfloat162 const*>(lora_b_base + static_cast<size_t>(out_idx + 1) * 16);
+  __nv_bfloat162 lora_b0_pairs[8];
+  __nv_bfloat162 lora_b1_pairs[8];
+#pragma unroll
+  for (int rank_pair = 0; rank_pair < 8; ++rank_pair) {
+    lora_b0_pairs[rank_pair] = lora_b_row0_pairs[rank_pair];
+    lora_b1_pairs[rank_pair] = lora_b_row1_pairs[rank_pair];
+  }
+
+  auto add_row = [&](int64_t row) {
+    auto const* low_rank_pairs =
+        reinterpret_cast<__nv_bfloat162 const*>(low_rank_workspace + row * 16);
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    if (lora_rank == 16) {
+#pragma unroll
+      for (int rank_pair = 0; rank_pair < 8; ++rank_pair) {
+        float2 const low_rank_value = __bfloat1622float2(low_rank_pairs[rank_pair]);
+        float2 const lora_b0_value = __bfloat1622float2(lora_b0_pairs[rank_pair]);
+        float2 const lora_b1_value = __bfloat1622float2(lora_b1_pairs[rank_pair]);
+        acc0 += low_rank_value.x * lora_b0_value.x;
+        acc0 += low_rank_value.y * lora_b0_value.y;
+        acc1 += low_rank_value.x * lora_b1_value.x;
+        acc1 += low_rank_value.y * lora_b1_value.y;
+      }
+    } else {
+      int const rank_pairs = lora_rank >> 1;
+#pragma unroll
+      for (int rank_pair = 0; rank_pair < 8; ++rank_pair) {
+        if (rank_pair < rank_pairs) {
+          float2 const low_rank_value = __bfloat1622float2(low_rank_pairs[rank_pair]);
+          float2 const lora_b0_value = __bfloat1622float2(lora_b0_pairs[rank_pair]);
+          float2 const lora_b1_value = __bfloat1622float2(lora_b1_pairs[rank_pair]);
+          acc0 += low_rank_value.x * lora_b0_value.x;
+          acc0 += low_rank_value.y * lora_b0_value.y;
+          acc1 += low_rank_value.x * lora_b1_value.x;
+          acc1 += low_rank_value.y * lora_b1_value.y;
+        }
+      }
+      if ((lora_rank & 1) != 0) {
+        int const rank_idx = rank_pairs << 1;
+        auto const* low_rank = reinterpret_cast<__nv_bfloat16 const*>(low_rank_pairs);
+        auto const* lora_b_row0 = reinterpret_cast<__nv_bfloat16 const*>(lora_b0_pairs);
+        auto const* lora_b_row1 = reinterpret_cast<__nv_bfloat16 const*>(lora_b1_pairs);
+        float const low_rank_value = __bfloat162float(low_rank[rank_idx]);
+        acc0 += low_rank_value * __bfloat162float(lora_b_row0[rank_idx]);
+        acc1 += low_rank_value * __bfloat162float(lora_b_row1[rank_idx]);
+      }
+    }
+
+    auto* output_pairs = reinterpret_cast<__nv_bfloat162*>(output + row * out_hidden_size);
+    if constexpr (AddToOutput) {
+      float2 output_value = __bfloat1622float2(output_pairs[out_pair]);
+      acc0 += output_value.x;
+      acc1 += output_value.y;
+    }
+    output_pairs[out_pair] = __floats2bfloat162_rn(acc0, acc1);
+  };
+
+  if (use_row_list) {
+    for (int offset = 0; offset < row_count; ++offset) {
+      add_row(row_indices[offset]);
+    }
+  } else if (rows_grouped_by_adapter && adapter_expert_row_starts != nullptr) {
+    for (int offset = 0; offset < row_count; ++offset) {
+      add_row(static_cast<int64_t>(row_start) + offset);
+    }
+  } else {
+    int64_t const begin = expert_first_token_offset[expert];
+    int64_t const end = expert_first_token_offset[expert + 1];
+    for (int64_t row = begin; row < end; ++row) {
+      if (permuted_lora_indices[row] != adapter) {
+        continue;
+      }
+      add_row(row);
+    }
+  }
+}
+
+inline void fc2LoraRank16Bf16GroupedOutputAdd(
+    __nv_bfloat16* output, __nv_bfloat16 const* low_rank_workspace,
+    int64_t const* expert_first_token_offset, int64_t out_hidden_size, int num_experts_per_node,
+    int num_lora_adapters, int32_t const* adapter_lora_ranks,
+    void const* const* adapter_lora_weight_ptrs, int32_t const* permuted_lora_indices,
+    int32_t const* adapter_expert_row_counts, int32_t const* adapter_expert_row_indices,
+    int adapter_expert_row_capacity, int32_t const* adapter_expert_row_starts,
+    bool rows_grouped_by_adapter, cudaStream_t stream) {
+  constexpr int threads = 256;
+  dim3 const grid(static_cast<unsigned int>(((out_hidden_size >> 1) + threads - 1) / threads),
+                  static_cast<unsigned int>(num_lora_adapters),
+                  static_cast<unsigned int>(num_experts_per_node));
+  fc2LoraRank16Bf16GroupedOutputKernel<true><<<grid, threads, 0, stream>>>(
+      output, low_rank_workspace, expert_first_token_offset, out_hidden_size, num_lora_adapters,
+      adapter_lora_ranks, adapter_lora_weight_ptrs, permuted_lora_indices,
+      adapter_expert_row_counts, adapter_expert_row_indices, adapter_expert_row_capacity,
+      adapter_expert_row_starts, rows_grouped_by_adapter);
+}
+
+inline void fc2LoraRank16Bf16GroupedOutput(
+    __nv_bfloat16* output, __nv_bfloat16 const* low_rank_workspace,
+    int64_t const* expert_first_token_offset, int64_t out_hidden_size, int num_experts_per_node,
+    int num_lora_adapters, int32_t const* adapter_lora_ranks,
+    void const* const* adapter_lora_weight_ptrs, int32_t const* permuted_lora_indices,
+    int32_t const* adapter_expert_row_counts, int32_t const* adapter_expert_row_indices,
+    int adapter_expert_row_capacity, int32_t const* adapter_expert_row_starts,
+    bool rows_grouped_by_adapter, cudaStream_t stream) {
+  constexpr int threads = 256;
+  dim3 const grid(static_cast<unsigned int>(((out_hidden_size >> 1) + threads - 1) / threads),
+                  static_cast<unsigned int>(num_lora_adapters),
+                  static_cast<unsigned int>(num_experts_per_node));
+  fc2LoraRank16Bf16GroupedOutputKernel<false><<<grid, threads, 0, stream>>>(
+      output, low_rank_workspace, expert_first_token_offset, out_hidden_size, num_lora_adapters,
+      adapter_lora_ranks, adapter_lora_weight_ptrs, permuted_lora_indices,
+      adapter_expert_row_counts, adapter_expert_row_indices, adapter_expert_row_capacity,
+      adapter_expert_row_starts, rows_grouped_by_adapter);
+}
+
+static __global__ void fc1GatedLoraRank16Bf16GroupedOutputKernel(
+    __nv_bfloat16* output, __nv_bfloat16 const* low_rank_workspace,
+    int64_t const* expert_first_token_offset, int64_t inter_size, int64_t output_stride,
+    int64_t expanded_num_rows, int num_lora_adapters, int32_t const* adapter_gated_lora_ranks,
+    void const* const* adapter_gated_lora_weight_ptrs, int32_t const* adapter_fc1_lora_ranks,
+    void const* const* adapter_fc1_lora_weight_ptrs,
+    void const* const* permuted_gated_lora_weight_ptrs,
+    void const* const* permuted_fc1_lora_weight_ptrs, int32_t const* permuted_lora_indices,
+    int32_t const* adapter_expert_row_counts, int32_t const* adapter_expert_row_indices,
+    int adapter_expert_row_capacity, int32_t const* no_adapter_expert_row_counts,
+    int32_t const* no_adapter_expert_row_indices, int no_adapter_expert_row_capacity,
+    int32_t const* adapter_expert_row_starts, int32_t const* no_adapter_expert_row_starts,
+    bool rows_grouped_by_adapter, int32_t const* fc1_gated_lora_has_missing_rows) {
+  int64_t const out_pair = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t const out_hidden_pairs = inter_size >> 1;
+  int const adapter = static_cast<int>(blockIdx.y);
+  int const expert = static_cast<int>(blockIdx.z);
+  if (out_pair >= out_hidden_pairs || adapter >= num_lora_adapters) {
+    return;
+  }
+
+  bool const has_row_list = adapter_expert_row_counts != nullptr &&
+                            adapter_expert_row_indices != nullptr &&
+                            adapter_expert_row_capacity > 0;
+  bool use_row_list = false;
+  int row_count = 0;
+  int row_start = 0;
+  int32_t const* row_indices = nullptr;
+  if (has_row_list) {
+    int const bucket = expert * num_lora_adapters + adapter;
+    row_count = adapter_expert_row_counts[bucket];
+    if (rows_grouped_by_adapter && adapter_expert_row_starts != nullptr) {
+      row_start = adapter_expert_row_starts[bucket];
+    } else if (row_count <= adapter_expert_row_capacity) {
+      use_row_list = true;
+      row_indices =
+          adapter_expert_row_indices + static_cast<int64_t>(bucket) * adapter_expert_row_capacity;
+    }
+  }
+
+  int32_t const raw_gated_rank = adapter_gated_lora_ranks[adapter];
+  int32_t const raw_fc1_rank = adapter_fc1_lora_ranks[adapter];
+  int const gated_rank = raw_gated_rank <= 0 ? 0 : (raw_gated_rank < 16 ? raw_gated_rank : 16);
+  int const fc1_rank = raw_fc1_rank <= 0 ? 0 : (raw_fc1_rank < 16 ? raw_fc1_rank : 16);
+  if (gated_rank <= 0 && fc1_rank <= 0) {
+    return;
+  }
+
+  auto const* gated_b_base =
+      reinterpret_cast<__nv_bfloat16 const*>(adapter_gated_lora_weight_ptrs[adapter * 2 + 1]);
+  auto const* fc1_b_base =
+      reinterpret_cast<__nv_bfloat16 const*>(adapter_fc1_lora_weight_ptrs[adapter * 2 + 1]);
+  if (gated_rank > 0 && gated_b_base != nullptr) {
+    gated_b_base += static_cast<size_t>(expert) * static_cast<size_t>(inter_size) * 16;
+  } else {
+    gated_b_base = nullptr;
+  }
+  if (fc1_rank > 0 && fc1_b_base != nullptr) {
+    fc1_b_base += static_cast<size_t>(expert) * static_cast<size_t>(inter_size) * 16;
+  } else {
+    fc1_b_base = nullptr;
+  }
+  if (gated_b_base == nullptr && fc1_b_base == nullptr) {
+    return;
+  }
+
+  int64_t const out_idx = out_pair << 1;
+  __nv_bfloat162 gated_b0_pairs[8];
+  __nv_bfloat162 gated_b1_pairs[8];
+  __nv_bfloat162 fc1_b0_pairs[8];
+  __nv_bfloat162 fc1_b1_pairs[8];
+  if (gated_b_base != nullptr) {
+    auto const* gated_b_row0_pairs =
+        reinterpret_cast<__nv_bfloat162 const*>(gated_b_base + static_cast<size_t>(out_idx) * 16);
+    auto const* gated_b_row1_pairs = reinterpret_cast<__nv_bfloat162 const*>(
+        gated_b_base + static_cast<size_t>(out_idx + 1) * 16);
+#pragma unroll
+    for (int rank_pair = 0; rank_pair < 8; ++rank_pair) {
+      gated_b0_pairs[rank_pair] = gated_b_row0_pairs[rank_pair];
+      gated_b1_pairs[rank_pair] = gated_b_row1_pairs[rank_pair];
+    }
+  }
+  if (fc1_b_base != nullptr) {
+    auto const* fc1_b_row0_pairs =
+        reinterpret_cast<__nv_bfloat162 const*>(fc1_b_base + static_cast<size_t>(out_idx) * 16);
+    auto const* fc1_b_row1_pairs =
+        reinterpret_cast<__nv_bfloat162 const*>(fc1_b_base + static_cast<size_t>(out_idx + 1) * 16);
+#pragma unroll
+    for (int rank_pair = 0; rank_pair < 8; ++rank_pair) {
+      fc1_b0_pairs[rank_pair] = fc1_b_row0_pairs[rank_pair];
+      fc1_b1_pairs[rank_pair] = fc1_b_row1_pairs[rank_pair];
+    }
+  }
+
+  int64_t const begin = expert_first_token_offset[expert];
+  int64_t const end = expert_first_token_offset[expert + 1];
+  __nv_bfloat16 const* gated_low_rank_workspace = low_rank_workspace;
+  __nv_bfloat16 const* fc1_low_rank_workspace = low_rank_workspace + expanded_num_rows * 16;
+
+  auto zero_missing_lora_outputs = [&](int64_t row) {
+    if (permuted_lora_indices != nullptr && permuted_lora_indices[row] < 0) {
+      auto* gated_output_pairs = reinterpret_cast<__nv_bfloat162*>(output + row * output_stride);
+      auto* fc1_output_pairs =
+          reinterpret_cast<__nv_bfloat162*>(output + row * output_stride + inter_size);
+      gated_output_pairs[out_pair] = __floats2bfloat162_rn(0.0f, 0.0f);
+      fc1_output_pairs[out_pair] = __floats2bfloat162_rn(0.0f, 0.0f);
+      return;
+    }
+    if (permuted_gated_lora_weight_ptrs[row * 2 + 1] == nullptr) {
+      auto* output_pairs = reinterpret_cast<__nv_bfloat162*>(output + row * output_stride);
+      output_pairs[out_pair] = __floats2bfloat162_rn(0.0f, 0.0f);
+    }
+    if (permuted_fc1_lora_weight_ptrs[row * 2 + 1] == nullptr) {
+      auto* output_pairs =
+          reinterpret_cast<__nv_bfloat162*>(output + row * output_stride + inter_size);
+      output_pairs[out_pair] = __floats2bfloat162_rn(0.0f, 0.0f);
+    }
+  };
+
+  if (adapter == 0) {
+    bool const has_no_adapter_row_list =
+        no_adapter_expert_row_counts != nullptr &&
+        ((no_adapter_expert_row_indices != nullptr && no_adapter_expert_row_capacity > 0) ||
+         (rows_grouped_by_adapter && no_adapter_expert_row_starts != nullptr)) &&
+        (fc1_gated_lora_has_missing_rows == nullptr || *fc1_gated_lora_has_missing_rows == 0);
+    bool used_no_adapter_row_list = false;
+    if (has_no_adapter_row_list) {
+      int const no_adapter_row_count = no_adapter_expert_row_counts[expert];
+      if (rows_grouped_by_adapter && no_adapter_expert_row_starts != nullptr &&
+          no_adapter_row_count > 0) {
+        used_no_adapter_row_list = true;
+        int const no_adapter_row_start = no_adapter_expert_row_starts[expert];
+        for (int offset = 0; offset < no_adapter_row_count; ++offset) {
+          int64_t const row = static_cast<int64_t>(no_adapter_row_start) + offset;
+          auto* gated_output_pairs =
+              reinterpret_cast<__nv_bfloat162*>(output + row * output_stride);
+          auto* fc1_output_pairs =
+              reinterpret_cast<__nv_bfloat162*>(output + row * output_stride + inter_size);
+          gated_output_pairs[out_pair] = __floats2bfloat162_rn(0.0f, 0.0f);
+          fc1_output_pairs[out_pair] = __floats2bfloat162_rn(0.0f, 0.0f);
+        }
+      } else if (no_adapter_row_count >= 0 &&
+                 no_adapter_row_count <= no_adapter_expert_row_capacity) {
+        used_no_adapter_row_list = true;
+        auto const* no_adapter_row_indices =
+            no_adapter_expert_row_indices +
+            static_cast<int64_t>(expert) * no_adapter_expert_row_capacity;
+        for (int offset = 0; offset < no_adapter_row_count; ++offset) {
+          int64_t const row = no_adapter_row_indices[offset];
+          auto* gated_output_pairs =
+              reinterpret_cast<__nv_bfloat162*>(output + row * output_stride);
+          auto* fc1_output_pairs =
+              reinterpret_cast<__nv_bfloat162*>(output + row * output_stride + inter_size);
+          gated_output_pairs[out_pair] = __floats2bfloat162_rn(0.0f, 0.0f);
+          fc1_output_pairs[out_pair] = __floats2bfloat162_rn(0.0f, 0.0f);
+        }
+      }
+    }
+    if (!used_no_adapter_row_list) {
+      for (int64_t row = begin; row < end; ++row) {
+        zero_missing_lora_outputs(row);
+      }
+    }
+  }
+  if (has_row_list && row_count <= 0) {
+    return;
+  }
+
+  auto add_row = [&](int64_t row) {
+    if (gated_b_base != nullptr) {
+      auto const* low_rank_pairs =
+          reinterpret_cast<__nv_bfloat162 const*>(gated_low_rank_workspace + row * 16);
+      float acc0 = 0.0f;
+      float acc1 = 0.0f;
+      int const rank_pairs = gated_rank >> 1;
+#pragma unroll
+      for (int rank_pair = 0; rank_pair < 8; ++rank_pair) {
+        if (rank_pair < rank_pairs) {
+          float2 const low_rank_value = __bfloat1622float2(low_rank_pairs[rank_pair]);
+          float2 const lora_b0_value = __bfloat1622float2(gated_b0_pairs[rank_pair]);
+          float2 const lora_b1_value = __bfloat1622float2(gated_b1_pairs[rank_pair]);
+          acc0 += low_rank_value.x * lora_b0_value.x;
+          acc0 += low_rank_value.y * lora_b0_value.y;
+          acc1 += low_rank_value.x * lora_b1_value.x;
+          acc1 += low_rank_value.y * lora_b1_value.y;
+        }
+      }
+      if ((gated_rank & 1) != 0) {
+        int const rank_idx = rank_pairs << 1;
+        auto const* low_rank = reinterpret_cast<__nv_bfloat16 const*>(low_rank_pairs);
+        auto const* lora_b_row0 = reinterpret_cast<__nv_bfloat16 const*>(gated_b0_pairs);
+        auto const* lora_b_row1 = reinterpret_cast<__nv_bfloat16 const*>(gated_b1_pairs);
+        float const low_rank_value = __bfloat162float(low_rank[rank_idx]);
+        acc0 += low_rank_value * __bfloat162float(lora_b_row0[rank_idx]);
+        acc1 += low_rank_value * __bfloat162float(lora_b_row1[rank_idx]);
+      }
+      auto* output_pairs = reinterpret_cast<__nv_bfloat162*>(output + row * output_stride);
+      output_pairs[out_pair] = __floats2bfloat162_rn(acc0, acc1);
+    }
+
+    if (fc1_b_base != nullptr) {
+      auto const* low_rank_pairs =
+          reinterpret_cast<__nv_bfloat162 const*>(fc1_low_rank_workspace + row * 16);
+      float acc0 = 0.0f;
+      float acc1 = 0.0f;
+      int const rank_pairs = fc1_rank >> 1;
+#pragma unroll
+      for (int rank_pair = 0; rank_pair < 8; ++rank_pair) {
+        if (rank_pair < rank_pairs) {
+          float2 const low_rank_value = __bfloat1622float2(low_rank_pairs[rank_pair]);
+          float2 const lora_b0_value = __bfloat1622float2(fc1_b0_pairs[rank_pair]);
+          float2 const lora_b1_value = __bfloat1622float2(fc1_b1_pairs[rank_pair]);
+          acc0 += low_rank_value.x * lora_b0_value.x;
+          acc0 += low_rank_value.y * lora_b0_value.y;
+          acc1 += low_rank_value.x * lora_b1_value.x;
+          acc1 += low_rank_value.y * lora_b1_value.y;
+        }
+      }
+      if ((fc1_rank & 1) != 0) {
+        int const rank_idx = rank_pairs << 1;
+        auto const* low_rank = reinterpret_cast<__nv_bfloat16 const*>(low_rank_pairs);
+        auto const* lora_b_row0 = reinterpret_cast<__nv_bfloat16 const*>(fc1_b0_pairs);
+        auto const* lora_b_row1 = reinterpret_cast<__nv_bfloat16 const*>(fc1_b1_pairs);
+        float const low_rank_value = __bfloat162float(low_rank[rank_idx]);
+        acc0 += low_rank_value * __bfloat162float(lora_b_row0[rank_idx]);
+        acc1 += low_rank_value * __bfloat162float(lora_b_row1[rank_idx]);
+      }
+      auto* output_pairs =
+          reinterpret_cast<__nv_bfloat162*>(output + row * output_stride + inter_size);
+      output_pairs[out_pair] = __floats2bfloat162_rn(acc0, acc1);
+    }
+  };
+
+  if (use_row_list) {
+    for (int offset = 0; offset < row_count; ++offset) {
+      add_row(row_indices[offset]);
+    }
+  } else if (rows_grouped_by_adapter && adapter_expert_row_starts != nullptr) {
+    if (row_count <= 0 || row_start < 0) {
+      return;
+    }
+    for (int offset = 0; offset < row_count; ++offset) {
+      add_row(static_cast<int64_t>(row_start) + offset);
+    }
+  } else {
+    for (int64_t row = begin; row < end; ++row) {
+      if (permuted_lora_indices[row] == adapter) {
+        add_row(row);
+      }
+    }
+  }
+}
+
+inline void fc1GatedLoraRank16Bf16GroupedOutput(
+    __nv_bfloat16* output, __nv_bfloat16 const* low_rank_workspace,
+    int64_t const* expert_first_token_offset, int64_t expanded_num_rows, int64_t inter_size,
+    int num_experts_per_node, int num_lora_adapters, int32_t const* adapter_gated_lora_ranks,
+    void const* const* adapter_gated_lora_weight_ptrs, int32_t const* adapter_fc1_lora_ranks,
+    void const* const* adapter_fc1_lora_weight_ptrs,
+    void const* const* permuted_gated_lora_weight_ptrs,
+    void const* const* permuted_fc1_lora_weight_ptrs, int32_t const* permuted_lora_indices,
+    int32_t const* adapter_expert_row_counts, int32_t const* adapter_expert_row_indices,
+    int adapter_expert_row_capacity, int32_t const* no_adapter_expert_row_counts,
+    int32_t const* no_adapter_expert_row_indices, int no_adapter_expert_row_capacity,
+    int32_t const* adapter_expert_row_starts, int32_t const* no_adapter_expert_row_starts,
+    bool rows_grouped_by_adapter, int32_t const* fc1_gated_lora_has_missing_rows,
+    cudaStream_t stream) {
+  constexpr int threads = 128;
+  dim3 const grid(static_cast<unsigned int>(((inter_size >> 1) + threads - 1) / threads),
+                  static_cast<unsigned int>(num_lora_adapters),
+                  static_cast<unsigned int>(num_experts_per_node));
+  fc1GatedLoraRank16Bf16GroupedOutputKernel<<<grid, threads, 0, stream>>>(
+      output, low_rank_workspace, expert_first_token_offset, inter_size, inter_size * 2,
+      expanded_num_rows, num_lora_adapters, adapter_gated_lora_ranks,
+      adapter_gated_lora_weight_ptrs, adapter_fc1_lora_ranks, adapter_fc1_lora_weight_ptrs,
+      permuted_gated_lora_weight_ptrs, permuted_fc1_lora_weight_ptrs, permuted_lora_indices,
+      adapter_expert_row_counts, adapter_expert_row_indices, adapter_expert_row_capacity,
+      no_adapter_expert_row_counts, no_adapter_expert_row_indices, no_adapter_expert_row_capacity,
+      adapter_expert_row_starts, no_adapter_expert_row_starts, rows_grouped_by_adapter,
+      fc1_gated_lora_has_missing_rows);
+}
+
+using namespace nvcuda;
+
+__global__ void loraLowRank16Bf16TensorCoreGroupedKernel(
+    __nv_bfloat16 const* input, int64_t input_hidden_size, int64_t expanded_num_rows,
+    int64_t num_tokens, int64_t lora_a_expert_stride, int num_lora_adapters,
+    int num_experts_per_node, int num_lora_modules, int32_t const* adapter_lora_ranks,
+    void const* const* adapter_lora_weight_ptrs, int32_t const* adapter_expert_row_counts,
+    int32_t const* adapter_expert_row_starts, __nv_bfloat16* low_rank_workspace) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+  constexpr int kRowsPerWarp = 16;
+  constexpr int kWarpsPerBlock = 1;
+  constexpr int kRowsPerBlock = kRowsPerWarp * kWarpsPerBlock;
+  int const row_block = static_cast<int>(blockIdx.x);
+  int const adapter = static_cast<int>(blockIdx.y);
+  int const module_expert = static_cast<int>(blockIdx.z);
+  int const module = module_expert / num_experts_per_node;
+  int const expert = module_expert - module * num_experts_per_node;
+  int const bucket = expert * num_lora_adapters + adapter;
+  int const warp_id = threadIdx.x >> 5;
+  int const lane = threadIdx.x & 31;
+
+  int32_t const row_count = adapter_expert_row_counts[bucket];
+  int32_t const row_start = adapter_expert_row_starts[bucket];
+  if (row_count <= 0 || row_start < 0) {
+    return;
+  }
+
+  int32_t const raw_rank = adapter_lora_ranks[adapter];
+  int const lora_rank = raw_rank <= 0 ? 0 : (raw_rank < 16 ? raw_rank : 16);
+  auto const* lora_a_base =
+      reinterpret_cast<__nv_bfloat16 const*>(adapter_lora_weight_ptrs[adapter * 2]);
+  if (lora_rank <= 0 || lora_a_base == nullptr) {
+    return;
+  }
+  bool const full_rank = lora_rank == 16;
+  lora_a_base += static_cast<size_t>(expert) * static_cast<size_t>(lora_a_expert_stride);
+  bool const use_direct_b = full_rank;
+
+  __shared__ __nv_bfloat16 a_smem[kWarpsPerBlock][16 * 16];
+  __shared__ __nv_bfloat16 b_smem[2][16 * 16];
+  __shared__ float c_smem[kWarpsPerBlock][16 * 16];
+  for (int tile_idx = row_block; tile_idx * kRowsPerBlock < row_count; tile_idx += gridDim.x) {
+    int const tile_row = tile_idx * kRowsPerBlock;
+    int const block_valid_rows = min(kRowsPerBlock, row_count - tile_row);
+    int const warp_row_offset = warp_id * kRowsPerWarp;
+    int const valid_rows = max(0, min(kRowsPerWarp, block_valid_rows - warp_row_offset));
+    int64_t const row = static_cast<int64_t>(row_start) + tile_row + warp_row_offset;
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    for (int64_t k = 0; k < input_hidden_size; k += 16) {
+      if (use_direct_b) {
+        for (int idx = lane; idx < 16 * 16; idx += 32) {
+          int const local_row = idx >> 4;
+          int const local_col = idx & 15;
+          a_smem[warp_id][idx] = local_row < valid_rows
+                                     ? input[(row + local_row) * input_hidden_size + k + local_col]
+                                     : __float2bfloat16(0.0f);
+        }
+        __syncwarp();
+        wmma::load_matrix_sync(a_frag, a_smem[warp_id], 16);
+        wmma::load_matrix_sync(b_frag, lora_a_base + k, static_cast<int>(input_hidden_size));
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+      } else {
+        int const stage = (static_cast<int>(k >> 4) & 1);
+        for (int idx = threadIdx.x; idx < 16 * 16; idx += blockDim.x) {
+          int const local_k = idx & 15;
+          int const rank = idx >> 4;
+          b_smem[stage][idx] =
+              rank < lora_rank
+                  ? lora_a_base[k + local_k + static_cast<int64_t>(rank) * input_hidden_size]
+                  : __float2bfloat16(0.0f);
+        }
+        for (int idx = lane; idx < 16 * 16; idx += 32) {
+          int const local_row = idx >> 4;
+          int const local_col = idx & 15;
+          a_smem[warp_id][idx] = local_row < valid_rows
+                                     ? input[(row + local_row) * input_hidden_size + k + local_col]
+                                     : __float2bfloat16(0.0f);
+        }
+        __syncthreads();
+        wmma::load_matrix_sync(a_frag, a_smem[warp_id], 16);
+        wmma::load_matrix_sync(b_frag, b_smem[stage], 16);
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+      }
+    }
+
+    wmma::store_matrix_sync(c_smem[warp_id], c_frag, 16, wmma::mem_row_major);
+    __syncwarp();
+
+    for (int idx = lane; idx < valid_rows * 16; idx += 32) {
+      int const local_row = idx / 16;
+      int const rank = idx - local_row * 16;
+      size_t const out_offset =
+          (static_cast<size_t>(module) * static_cast<size_t>(expanded_num_rows) +
+           static_cast<size_t>(row + local_row)) *
+              16 +
+          static_cast<size_t>(rank);
+      low_rank_workspace[out_offset] =
+          (full_rank || rank < lora_rank) ? __float2bfloat16(c_smem[warp_id][local_row * 16 + rank])
+                                          : __float2bfloat16(0.0f);
+    }
+  }
+#endif
+}
+
+inline void loraLowRank16Bf16TensorCoreGrouped(
+    __nv_bfloat16 const* input, int64_t input_hidden_size, int64_t expanded_num_rows,
+    int64_t num_tokens, int64_t lora_a_expert_stride, int num_lora_adapters,
+    int num_experts_per_node, int num_lora_modules, int32_t const* adapter_lora_ranks,
+    void const* const* adapter_lora_weight_ptrs, int32_t const* adapter_expert_row_counts,
+    int32_t const* adapter_expert_row_starts, __nv_bfloat16* low_rank_workspace,
+    cudaStream_t stream) {
+  constexpr int threads = 32;
+  constexpr int rows_per_block = 16;
+  int64_t const avg_rows_per_adapter = std::max<int64_t>(
+      1, (expanded_num_rows + num_experts_per_node * (num_lora_adapters + 1) - 1) /
+             (num_experts_per_node * (num_lora_adapters + 1)));
+  int max_row_blocks_per_bucket = static_cast<int>(std::min<int64_t>(
+      64, std::max<int64_t>(1, (avg_rows_per_adapter + rows_per_block - 1) / rows_per_block)));
+  dim3 const grid(static_cast<unsigned int>(max_row_blocks_per_bucket),
+                  static_cast<unsigned int>(num_lora_adapters),
+                  static_cast<unsigned int>(num_lora_modules * num_experts_per_node));
+  loraLowRank16Bf16TensorCoreGroupedKernel<<<grid, threads, 0, stream>>>(
+      input, input_hidden_size, expanded_num_rows, num_tokens, lora_a_expert_stride,
+      num_lora_adapters, num_experts_per_node, num_lora_modules, adapter_lora_ranks,
+      adapter_lora_weight_ptrs, adapter_expert_row_counts, adapter_expert_row_starts,
+      low_rank_workspace);
+}
+
+template <bool UseOriginalInput>
+__global__ void loraLowRank16Bf16TensorCoreGroupedDualKernel(
+    __nv_bfloat16 const* input, int64_t input_hidden_size, int64_t expanded_num_rows,
+    int64_t num_tokens, int64_t lora_a_expert_stride, int num_lora_adapters,
+    int num_experts_per_node, int32_t const* adapter_lora_ranks0,
+    void const* const* adapter_lora_weight_ptrs0, int32_t const* adapter_lora_ranks1,
+    void const* const* adapter_lora_weight_ptrs1, int32_t const* adapter_expert_row_counts,
+    int32_t const* adapter_expert_row_starts, __nv_bfloat16* low_rank_workspace0,
+    __nv_bfloat16* low_rank_workspace1, int const* input_row_to_unpermuted_row,
+    int64_t original_num_rows, bool force_shared_lora_a) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+  constexpr int kRowsPerWarp = 16;
+  constexpr int kWarpsPerBlock = 1;
+  constexpr int kRowsPerBlock = kRowsPerWarp * kWarpsPerBlock;
+  int const row_block = static_cast<int>(blockIdx.x);
+  int const adapter = static_cast<int>(blockIdx.y);
+  int const expert = static_cast<int>(blockIdx.z);
+  int const bucket = expert * num_lora_adapters + adapter;
+  int const warp_id = threadIdx.x >> 5;
+  int const lane = threadIdx.x & 31;
+
+  int32_t const row_count = adapter_expert_row_counts[bucket];
+  int32_t const row_start = adapter_expert_row_starts[bucket];
+  if (row_count <= 0 || row_start < 0) {
+    return;
+  }
+
+  int32_t const raw_rank0 = adapter_lora_ranks0[adapter];
+  int32_t const raw_rank1 = adapter_lora_ranks1[adapter];
+  int const lora_rank0 = raw_rank0 <= 0 ? 0 : (raw_rank0 < 16 ? raw_rank0 : 16);
+  int const lora_rank1 = raw_rank1 <= 0 ? 0 : (raw_rank1 < 16 ? raw_rank1 : 16);
+  bool const full_rank0 = lora_rank0 == 16;
+  bool const full_rank1 = lora_rank1 == 16;
+  auto const* lora_a_base0 =
+      reinterpret_cast<__nv_bfloat16 const*>(adapter_lora_weight_ptrs0[adapter * 2]);
+  auto const* lora_a_base1 =
+      reinterpret_cast<__nv_bfloat16 const*>(adapter_lora_weight_ptrs1[adapter * 2]);
+  bool const use0 = lora_rank0 > 0 && lora_a_base0 != nullptr;
+  bool const use1 = lora_rank1 > 0 && lora_a_base1 != nullptr;
+  if (!use0 && !use1) {
+    return;
+  }
+  if (use0) {
+    lora_a_base0 += static_cast<size_t>(expert) * static_cast<size_t>(lora_a_expert_stride);
+  }
+  if (use1) {
+    lora_a_base1 += static_cast<size_t>(expert) * static_cast<size_t>(lora_a_expert_stride);
+  }
+  bool const use_direct_b =
+      (!force_shared_lora_a) && (!use0 || full_rank0) && (!use1 || full_rank1);
+  __shared__ __nv_bfloat16 a_smem[kWarpsPerBlock][16 * 16];
+  __shared__ __nv_bfloat16 b_smem0[2][16 * 16];
+  __shared__ __nv_bfloat16 b_smem1[2][16 * 16];
+  __shared__ float c_smem0[kWarpsPerBlock][16 * 16];
+  __shared__ float c_smem1[kWarpsPerBlock][16 * 16];
+
+  for (int tile_idx = row_block; tile_idx * kRowsPerBlock < row_count; tile_idx += gridDim.x) {
+    int const tile_row = tile_idx * kRowsPerBlock;
+    int const block_valid_rows = min(kRowsPerBlock, row_count - tile_row);
+    int const warp_row_offset = warp_id * kRowsPerWarp;
+    int const valid_rows = max(0, min(kRowsPerWarp, block_valid_rows - warp_row_offset));
+    int64_t const row = static_cast<int64_t>(row_start) + tile_row + warp_row_offset;
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b_frag0;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b_frag1;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag0;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag1;
+    wmma::fill_fragment(c_frag0, 0.0f);
+    wmma::fill_fragment(c_frag1, 0.0f);
+
+    for (int64_t k = 0; k < input_hidden_size; k += 16) {
+      if (use_direct_b) {
+        for (int idx = lane; idx < 16 * 16; idx += 32) {
+          int const local_row = idx >> 4;
+          int const local_col = idx & 15;
+          if (local_row < valid_rows) {
+            int64_t input_row = row + local_row;
+            if constexpr (UseOriginalInput) {
+              input_row =
+                  static_cast<int64_t>(input_row_to_unpermuted_row[input_row]) % original_num_rows;
+            }
+            a_smem[warp_id][idx] = input[input_row * input_hidden_size + k + local_col];
+          } else {
+            a_smem[warp_id][idx] = __float2bfloat16(0.0f);
+          }
+        }
+        __syncwarp();
+        wmma::load_matrix_sync(a_frag, a_smem[warp_id], 16);
+        if (use0) {
+          wmma::load_matrix_sync(b_frag0, lora_a_base0 + k, static_cast<int>(input_hidden_size));
+          wmma::mma_sync(c_frag0, a_frag, b_frag0, c_frag0);
+        }
+        if (use1) {
+          wmma::load_matrix_sync(b_frag1, lora_a_base1 + k, static_cast<int>(input_hidden_size));
+          wmma::mma_sync(c_frag1, a_frag, b_frag1, c_frag1);
+        }
+      } else {
+        int const stage = (static_cast<int>(k >> 4) & 1);
+        for (int idx = threadIdx.x; idx < 16 * 16; idx += blockDim.x) {
+          int const local_k = idx & 15;
+          int const rank = idx >> 4;
+          if (use0) {
+            if (full_rank0) {
+              b_smem0[stage][idx] =
+                  lora_a_base0[k + local_k + static_cast<int64_t>(rank) * input_hidden_size];
+            } else {
+              b_smem0[stage][idx] =
+                  rank < lora_rank0
+                      ? lora_a_base0[k + local_k + static_cast<int64_t>(rank) * input_hidden_size]
+                      : __float2bfloat16(0.0f);
+            }
+          }
+          if (use1) {
+            if (full_rank1) {
+              b_smem1[stage][idx] =
+                  lora_a_base1[k + local_k + static_cast<int64_t>(rank) * input_hidden_size];
+            } else {
+              b_smem1[stage][idx] =
+                  rank < lora_rank1
+                      ? lora_a_base1[k + local_k + static_cast<int64_t>(rank) * input_hidden_size]
+                      : __float2bfloat16(0.0f);
+            }
+          }
+        }
+        for (int idx = lane; idx < 16 * 16; idx += 32) {
+          int const local_row = idx >> 4;
+          int const local_col = idx & 15;
+          if (local_row < valid_rows) {
+            int64_t input_row = row + local_row;
+            if constexpr (UseOriginalInput) {
+              input_row =
+                  static_cast<int64_t>(input_row_to_unpermuted_row[input_row]) % original_num_rows;
+            }
+            a_smem[warp_id][idx] = input[input_row * input_hidden_size + k + local_col];
+          } else {
+            a_smem[warp_id][idx] = __float2bfloat16(0.0f);
+          }
+        }
+        __syncthreads();
+        wmma::load_matrix_sync(a_frag, a_smem[warp_id], 16);
+        if (use0) {
+          wmma::load_matrix_sync(b_frag0, b_smem0[stage], 16);
+          wmma::mma_sync(c_frag0, a_frag, b_frag0, c_frag0);
+        }
+        if (use1) {
+          wmma::load_matrix_sync(b_frag1, b_smem1[stage], 16);
+          wmma::mma_sync(c_frag1, a_frag, b_frag1, c_frag1);
+        }
+      }
+    }
+
+    if (use0) {
+      wmma::store_matrix_sync(c_smem0[warp_id], c_frag0, 16, wmma::mem_row_major);
+    }
+    if (use1) {
+      wmma::store_matrix_sync(c_smem1[warp_id], c_frag1, 16, wmma::mem_row_major);
+    }
+    __syncwarp();
+
+    for (int idx = lane; idx < valid_rows * 16; idx += 32) {
+      int const local_row = idx / 16;
+      int const rank = idx - local_row * 16;
+      size_t const out_offset = (static_cast<size_t>(row + local_row) * 16) + rank;
+      if (use0) {
+        low_rank_workspace0[out_offset] =
+            (full_rank0 || rank < lora_rank0)
+                ? __float2bfloat16(c_smem0[warp_id][local_row * 16 + rank])
+                : __float2bfloat16(0.0f);
+      }
+      if (use1) {
+        low_rank_workspace1[out_offset] =
+            (full_rank1 || rank < lora_rank1)
+                ? __float2bfloat16(c_smem1[warp_id][local_row * 16 + rank])
+                : __float2bfloat16(0.0f);
+      }
+    }
+  }
+#endif
+}
+
+inline void loraLowRank16Bf16TensorCoreGroupedDual(
+    __nv_bfloat16 const* input, int64_t input_hidden_size, int64_t expanded_num_rows,
+    int64_t num_tokens, int64_t lora_a_expert_stride, int num_lora_adapters,
+    int num_experts_per_node, int32_t const* adapter_lora_ranks0,
+    void const* const* adapter_lora_weight_ptrs0, int32_t const* adapter_lora_ranks1,
+    void const* const* adapter_lora_weight_ptrs1, int32_t const* adapter_expert_row_counts,
+    int32_t const* adapter_expert_row_starts, __nv_bfloat16* low_rank_workspace0,
+    __nv_bfloat16* low_rank_workspace1, cudaStream_t stream,
+    int const* input_row_to_unpermuted_row = nullptr, int64_t original_num_rows = 0) {
+  constexpr int threads = 32;
+  constexpr int rows_per_block = 16;
+  int64_t const avg_rows_per_adapter = std::max<int64_t>(
+      1, (expanded_num_rows + num_experts_per_node * (num_lora_adapters + 1) - 1) /
+             (num_experts_per_node * (num_lora_adapters + 1)));
+  int const max_row_blocks_per_bucket = static_cast<int>(std::min<int64_t>(
+      64, std::max<int64_t>(1, (avg_rows_per_adapter + rows_per_block - 1) / rows_per_block)));
+  dim3 const grid(static_cast<unsigned int>(max_row_blocks_per_bucket),
+                  static_cast<unsigned int>(num_lora_adapters),
+                  static_cast<unsigned int>(num_experts_per_node));
+  bool const force_shared_lora_a = false;
+  if (input_row_to_unpermuted_row != nullptr && original_num_rows > 0) {
+    loraLowRank16Bf16TensorCoreGroupedDualKernel<true><<<grid, threads, 0, stream>>>(
+        input, input_hidden_size, expanded_num_rows, num_tokens, lora_a_expert_stride,
+        num_lora_adapters, num_experts_per_node, adapter_lora_ranks0, adapter_lora_weight_ptrs0,
+        adapter_lora_ranks1, adapter_lora_weight_ptrs1, adapter_expert_row_counts,
+        adapter_expert_row_starts, low_rank_workspace0, low_rank_workspace1,
+        input_row_to_unpermuted_row, original_num_rows, force_shared_lora_a);
+  } else {
+    loraLowRank16Bf16TensorCoreGroupedDualKernel<false><<<grid, threads, 0, stream>>>(
+        input, input_hidden_size, expanded_num_rows, num_tokens, lora_a_expert_stride,
+        num_lora_adapters, num_experts_per_node, adapter_lora_ranks0, adapter_lora_weight_ptrs0,
+        adapter_lora_ranks1, adapter_lora_weight_ptrs1, adapter_expert_row_counts,
+        adapter_expert_row_starts, low_rank_workspace0, low_rank_workspace1, nullptr, 0,
+        force_shared_lora_a);
+  }
+}
+
+template <bool AddToOutput, int kWarpsPerBlock, int kNTilesPerWarp>
+__global__ void loraOutput16Bf16TensorCoreGroupedKernel(
+    __nv_bfloat16* output, __nv_bfloat16 const* low_rank_workspace, int64_t out_hidden_size,
+    int64_t output_stride, int num_lora_adapters, int num_experts_per_node,
+    int32_t const* adapter_lora_ranks, void const* const* adapter_lora_weight_ptrs,
+    int32_t const* adapter_expert_row_counts, int32_t const* adapter_expert_row_starts,
+    int n_tile_start, int n_tile_end) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+  int const warp_id = threadIdx.x >> 5;
+  int const lane = threadIdx.x & 31;
+  int const n_tile_base =
+      n_tile_start + (static_cast<int>(blockIdx.x) * kWarpsPerBlock + warp_id) * kNTilesPerWarp;
+  int const adapter = static_cast<int>(blockIdx.y);
+  int const expert = static_cast<int>(blockIdx.z);
+  int const out_tiles = static_cast<int>(out_hidden_size >> 4);
+  int const bucket = expert * num_lora_adapters + adapter;
+  int32_t const row_count = adapter_expert_row_counts[bucket];
+  int32_t const row_start = adapter_expert_row_starts[bucket];
+  if (row_count <= 0 || row_start < 0) {
+    return;
+  }
+
+  int32_t const raw_rank = adapter_lora_ranks[adapter];
+  int const lora_rank = raw_rank <= 0 ? 0 : (raw_rank < 16 ? raw_rank : 16);
+  bool const full_rank = lora_rank == 16;
+  auto const* lora_b_base =
+      reinterpret_cast<__nv_bfloat16 const*>(adapter_lora_weight_ptrs[adapter * 2 + 1]);
+  bool const has_lora = lora_rank > 0 && lora_b_base != nullptr;
+  if (has_lora) {
+    lora_b_base += static_cast<size_t>(expert) * static_cast<size_t>(out_hidden_size) * 16;
+  } else if constexpr (AddToOutput) {
+    return;
+  }
+
+  __shared__ __nv_bfloat16 a_smem[16 * 16];
+  __shared__ float c_smem[kWarpsPerBlock][16 * 16];
+
+  wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major>
+      b_frags[kNTilesPerWarp];
+  bool valid_n_tiles[kNTilesPerWarp];
+  bool has_valid_lora_tiles[kNTilesPerWarp];
+  bool do_mma = false;
+#pragma unroll
+  for (int tile_offset = 0; tile_offset < kNTilesPerWarp; ++tile_offset) {
+    int const n_tile = n_tile_base + tile_offset;
+    bool const valid_n_tile = n_tile < out_tiles && n_tile < n_tile_end;
+    bool const has_valid_lora_tile = has_lora && valid_n_tile;
+    valid_n_tiles[tile_offset] = valid_n_tile;
+    has_valid_lora_tiles[tile_offset] = has_valid_lora_tile;
+    do_mma = do_mma || has_valid_lora_tile;
+    if (has_valid_lora_tile) {
+      wmma::load_matrix_sync(b_frags[tile_offset],
+                             lora_b_base + static_cast<size_t>(n_tile) * 16 * 16, 16);
+    }
+  }
+  for (int tile_row = 0; tile_row < row_count; tile_row += 16) {
+    int const valid_rows = min(16, row_count - tile_row);
+    int64_t const row = static_cast<int64_t>(row_start) + tile_row;
+    for (int idx = threadIdx.x; idx < 16 * 16; idx += blockDim.x) {
+      int const local_row = idx >> 4;
+      int const rank = idx & 15;
+      bool const valid_row = local_row < valid_rows;
+      if (has_lora && full_rank) {
+        a_smem[idx] =
+            valid_row ? low_rank_workspace[(row + local_row) * 16 + rank] : __float2bfloat16(0.0f);
+      } else {
+        a_smem[idx] = (valid_row && rank < lora_rank)
+                          ? low_rank_workspace[(row + local_row) * 16 + rank]
+                          : __float2bfloat16(0.0f);
+      }
+    }
+    __syncthreads();
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
+    if (do_mma) {
+      wmma::load_matrix_sync(a_frag, a_smem, 16);
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int tile_offset = 0; tile_offset < kNTilesPerWarp; ++tile_offset) {
+      int const n_tile = n_tile_base + tile_offset;
+      bool const valid_n_tile = valid_n_tiles[tile_offset];
+      bool const has_valid_lora_tile = has_valid_lora_tiles[tile_offset];
+      if (has_valid_lora_tile) {
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+        wmma::fill_fragment(c_frag, 0.0f);
+        wmma::mma_sync(c_frag, a_frag, b_frags[tile_offset], c_frag);
+        wmma::store_matrix_sync(c_smem[warp_id], c_frag, 16, wmma::mem_row_major);
+      }
+      __syncwarp();
+      if (!valid_n_tile) {
+        continue;
+      }
+      for (int idx = lane; idx < valid_rows * 8; idx += 32) {
+        int const local_row = idx >> 3;
+        int const local_pair = idx & 7;
+        int const c_offset = local_row * 16 + local_pair * 2;
+        auto* out_pairs = reinterpret_cast<__nv_bfloat162*>(
+            output + (row + local_row) * output_stride + static_cast<int64_t>(n_tile) * 16);
+        if (has_valid_lora_tile) {
+          float value0 = c_smem[warp_id][c_offset];
+          float value1 = c_smem[warp_id][c_offset + 1];
+          if constexpr (AddToOutput) {
+            float2 prev = __bfloat1622float2(out_pairs[local_pair]);
+            value0 += prev.x;
+            value1 += prev.y;
+          }
+          out_pairs[local_pair] = __floats2bfloat162_rn(value0, value1);
+        } else {
+          out_pairs[local_pair] = __floats2bfloat162_rn(0.0f, 0.0f);
+        }
+      }
+      __syncwarp();
+    }
+  }
+#endif
+}
+
+template <bool AddToOutput, int kWarpsPerBlock, int kNTilesPerWarp>
+inline void launchLoraOutput16Bf16TensorCoreGrouped(
+    __nv_bfloat16* output, __nv_bfloat16 const* low_rank_workspace, int64_t out_hidden_size,
+    int64_t output_stride, int num_lora_adapters, int num_experts_per_node,
+    int32_t const* adapter_lora_ranks, void const* const* adapter_lora_weight_ptrs,
+    int32_t const* adapter_expert_row_counts, int32_t const* adapter_expert_row_starts,
+    cudaStream_t stream, int output_split_count = 1, int output_split_index = 0) {
+  constexpr int threads = 32 * kWarpsPerBlock;
+  int const out_tiles = static_cast<int>(out_hidden_size >> 4);
+  int const split_count = std::max(1, output_split_count);
+  int const split_index = std::max(0, std::min(output_split_index, split_count - 1));
+  int const n_tile_start =
+      static_cast<int>((static_cast<int64_t>(out_tiles) * split_index) / split_count);
+  int const n_tile_end =
+      static_cast<int>((static_cast<int64_t>(out_tiles) * (split_index + 1)) / split_count);
+  if (n_tile_end <= n_tile_start) {
+    return;
+  }
+  int const n_tile_groups =
+      static_cast<int>(((n_tile_end - n_tile_start) + kWarpsPerBlock * kNTilesPerWarp - 1) /
+                       (kWarpsPerBlock * kNTilesPerWarp));
+  dim3 const grid(static_cast<unsigned int>(n_tile_groups),
+                  static_cast<unsigned int>(num_lora_adapters),
+                  static_cast<unsigned int>(num_experts_per_node));
+  loraOutput16Bf16TensorCoreGroupedKernel<AddToOutput, kWarpsPerBlock, kNTilesPerWarp>
+      <<<grid, threads, 0, stream>>>(output, low_rank_workspace, out_hidden_size, output_stride,
+                                     num_lora_adapters, num_experts_per_node, adapter_lora_ranks,
+                                     adapter_lora_weight_ptrs, adapter_expert_row_counts,
+                                     adapter_expert_row_starts, n_tile_start, n_tile_end);
+}
+
+template <bool AddToOutput>
+inline void loraOutput16Bf16TensorCoreGrouped(
+    __nv_bfloat16* output, __nv_bfloat16 const* low_rank_workspace, int64_t out_hidden_size,
+    int64_t output_stride, int64_t expanded_num_rows, int num_lora_adapters,
+    int num_experts_per_node, int32_t const* adapter_lora_ranks,
+    void const* const* adapter_lora_weight_ptrs, int32_t const* adapter_expert_row_counts,
+    int32_t const* adapter_expert_row_starts, cudaStream_t stream, int output_split_count = 1,
+    int output_split_index = 0) {
+  if (out_hidden_size == 6144 && output_stride == 6144 && expanded_num_rows >= 262144 &&
+      num_experts_per_node == 256) {
+    launchLoraOutput16Bf16TensorCoreGrouped<AddToOutput, 4, 6>(
+        output, low_rank_workspace, out_hidden_size, output_stride, num_lora_adapters,
+        num_experts_per_node, adapter_lora_ranks, adapter_lora_weight_ptrs,
+        adapter_expert_row_counts, adapter_expert_row_starts, stream, output_split_count,
+        output_split_index);
+    return;
+  }
+  launchLoraOutput16Bf16TensorCoreGrouped<AddToOutput, 4, 4>(
+      output, low_rank_workspace, out_hidden_size, output_stride, num_lora_adapters,
+      num_experts_per_node, adapter_lora_ranks, adapter_lora_weight_ptrs, adapter_expert_row_counts,
+      adapter_expert_row_starts, stream, output_split_count, output_split_index);
+}
+
+__global__ void loraOutput16Bf16TensorCoreGroupedDualKernel(
+    __nv_bfloat16* output0, __nv_bfloat16* output1, __nv_bfloat16 const* low_rank_workspace0,
+    __nv_bfloat16 const* low_rank_workspace1, int64_t out_hidden_size, int64_t output_stride,
+    int num_lora_adapters, int num_experts_per_node, int32_t const* adapter_lora_ranks0,
+    void const* const* adapter_lora_weight_ptrs0, int32_t const* adapter_lora_ranks1,
+    void const* const* adapter_lora_weight_ptrs1, int32_t const* adapter_expert_row_counts,
+    int32_t const* adapter_expert_row_starts, int32_t const* no_adapter_expert_row_counts,
+    int32_t const* no_adapter_expert_row_starts, bool zero_no_adapter_rows) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+  constexpr int kWarpsPerBlock = 4;
+  constexpr int kNTilesPerWarp = 8;
+  int const warp_id = threadIdx.x >> 5;
+  int const lane = threadIdx.x & 31;
+  int const n_tile_base =
+      (static_cast<int>(blockIdx.x) * kWarpsPerBlock + warp_id) * kNTilesPerWarp;
+  int const adapter = static_cast<int>(blockIdx.y);
+  int const expert = static_cast<int>(blockIdx.z);
+  int const out_tiles = static_cast<int>(out_hidden_size >> 4);
+  int const bucket = expert * num_lora_adapters + adapter;
+  int32_t const row_count = adapter_expert_row_counts[bucket];
+  int32_t const row_start = adapter_expert_row_starts[bucket];
+
+  int32_t const raw_rank0 = adapter_lora_ranks0[adapter];
+  int32_t const raw_rank1 = adapter_lora_ranks1[adapter];
+  int const lora_rank0 = raw_rank0 <= 0 ? 0 : (raw_rank0 < 16 ? raw_rank0 : 16);
+  int const lora_rank1 = raw_rank1 <= 0 ? 0 : (raw_rank1 < 16 ? raw_rank1 : 16);
+  bool const full_rank0 = lora_rank0 == 16;
+  bool const full_rank1 = lora_rank1 == 16;
+  auto const* lora_b_base0 =
+      reinterpret_cast<__nv_bfloat16 const*>(adapter_lora_weight_ptrs0[adapter * 2 + 1]);
+  auto const* lora_b_base1 =
+      reinterpret_cast<__nv_bfloat16 const*>(adapter_lora_weight_ptrs1[adapter * 2 + 1]);
+  bool const has_lora0 = lora_rank0 > 0 && lora_b_base0 != nullptr;
+  bool const has_lora1 = lora_rank1 > 0 && lora_b_base1 != nullptr;
+  if (has_lora0) {
+    lora_b_base0 += static_cast<size_t>(expert) * static_cast<size_t>(out_hidden_size) * 16;
+  }
+  if (has_lora1) {
+    lora_b_base1 += static_cast<size_t>(expert) * static_cast<size_t>(out_hidden_size) * 16;
+  }
+
+  __shared__ __nv_bfloat16 a_smem0[16 * 16];
+  __shared__ __nv_bfloat16 a_smem1[16 * 16];
+  __shared__ float c_smem[kWarpsPerBlock][kNTilesPerWarp][16 * 16];
+  wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major>
+      b_frags0[kNTilesPerWarp];
+  wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major>
+      b_frags1[kNTilesPerWarp];
+  bool valid_n_tiles[kNTilesPerWarp];
+  bool has_valid_lora0_tiles[kNTilesPerWarp];
+  bool has_valid_lora1_tiles[kNTilesPerWarp];
+  bool do_mma0 = false;
+  bool do_mma1 = false;
+#pragma unroll
+  for (int tile_offset = 0; tile_offset < kNTilesPerWarp; ++tile_offset) {
+    int const n_tile = n_tile_base + tile_offset;
+    bool const valid_n_tile = n_tile < out_tiles;
+    bool const has_valid_lora0 = has_lora0 && valid_n_tile;
+    bool const has_valid_lora1 = has_lora1 && valid_n_tile;
+    valid_n_tiles[tile_offset] = valid_n_tile;
+    has_valid_lora0_tiles[tile_offset] = has_valid_lora0;
+    has_valid_lora1_tiles[tile_offset] = has_valid_lora1;
+    do_mma0 = do_mma0 || has_valid_lora0;
+    do_mma1 = do_mma1 || has_valid_lora1;
+    if (has_valid_lora0) {
+      wmma::load_matrix_sync(b_frags0[tile_offset],
+                             lora_b_base0 + static_cast<size_t>(n_tile) * 16 * 16, 16);
+    }
+    if (has_valid_lora1) {
+      wmma::load_matrix_sync(b_frags1[tile_offset],
+                             lora_b_base1 + static_cast<size_t>(n_tile) * 16 * 16, 16);
+    }
+  }
+
+  if (zero_no_adapter_rows && adapter == 0 && no_adapter_expert_row_counts != nullptr &&
+      no_adapter_expert_row_starts != nullptr) {
+    int32_t const no_adapter_row_count = no_adapter_expert_row_counts[expert];
+    int32_t const no_adapter_row_start = no_adapter_expert_row_starts[expert];
+    if (no_adapter_row_count > 0 && no_adapter_row_start >= 0) {
+      for (int tile_row = 0; tile_row < no_adapter_row_count; tile_row += 16) {
+        int const valid_rows = min(16, no_adapter_row_count - tile_row);
+        int64_t const row = static_cast<int64_t>(no_adapter_row_start) + tile_row;
+#pragma unroll
+        for (int tile_offset = 0; tile_offset < kNTilesPerWarp; ++tile_offset) {
+          int const n_tile = n_tile_base + tile_offset;
+          if (!valid_n_tiles[tile_offset]) {
+            continue;
+          }
+          for (int idx = lane; idx < valid_rows * 8; idx += 32) {
+            int const local_row = idx >> 3;
+            int const local_pair = idx & 7;
+            auto* out0_pairs = reinterpret_cast<__nv_bfloat162*>(
+                output0 + (row + local_row) * output_stride + static_cast<int64_t>(n_tile) * 16);
+            auto* out1_pairs = reinterpret_cast<__nv_bfloat162*>(
+                output1 + (row + local_row) * output_stride + static_cast<int64_t>(n_tile) * 16);
+            out0_pairs[local_pair] = __floats2bfloat162_rn(0.0f, 0.0f);
+            out1_pairs[local_pair] = __floats2bfloat162_rn(0.0f, 0.0f);
+          }
+        }
+      }
+    }
+  }
+
+  if (row_count <= 0 || row_start < 0) {
+    return;
+  }
+
+  for (int tile_row = 0; tile_row < row_count; tile_row += 16) {
+    int const valid_rows = min(16, row_count - tile_row);
+    int64_t const row = static_cast<int64_t>(row_start) + tile_row;
+    for (int idx = threadIdx.x; idx < 16 * 16; idx += blockDim.x) {
+      int const local_row = idx >> 4;
+      int const rank = idx & 15;
+      bool const valid_row = local_row < valid_rows;
+      a_smem0[idx] = (valid_row && has_lora0 && (full_rank0 || rank < lora_rank0))
+                         ? low_rank_workspace0[(row + local_row) * 16 + rank]
+                         : __float2bfloat16(0.0f);
+      a_smem1[idx] = (valid_row && has_lora1 && (full_rank1 || rank < lora_rank1))
+                         ? low_rank_workspace1[(row + local_row) * 16 + rank]
+                         : __float2bfloat16(0.0f);
+    }
+    __syncthreads();
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag0;
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag1;
+    if (do_mma0) {
+      wmma::load_matrix_sync(a_frag0, a_smem0, 16);
+    }
+    if (do_mma1) {
+      wmma::load_matrix_sync(a_frag1, a_smem1, 16);
+    }
+    __syncthreads();
+
+    if (do_mma0) {
+#pragma unroll
+      for (int tile_offset = 0; tile_offset < kNTilesPerWarp; ++tile_offset) {
+        if (!has_valid_lora0_tiles[tile_offset]) {
+          continue;
+        }
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+        wmma::fill_fragment(c_frag, 0.0f);
+        wmma::mma_sync(c_frag, a_frag0, b_frags0[tile_offset], c_frag);
+        wmma::store_matrix_sync(c_smem[warp_id][tile_offset], c_frag, 16, wmma::mem_row_major);
+      }
+    }
+    __syncwarp();
+
+#pragma unroll
+    for (int tile_offset = 0; tile_offset < kNTilesPerWarp; ++tile_offset) {
+      int const n_tile = n_tile_base + tile_offset;
+      bool const valid_n_tile = valid_n_tiles[tile_offset];
+      if (!valid_n_tile) {
+        continue;
+      }
+      bool const has_valid_lora0 = has_valid_lora0_tiles[tile_offset];
+      for (int idx = lane; idx < valid_rows * 8; idx += 32) {
+        int const local_row = idx >> 3;
+        int const local_pair = idx & 7;
+        int const c_offset = local_row * 16 + local_pair * 2;
+        auto* out0_pairs = reinterpret_cast<__nv_bfloat162*>(
+            output0 + (row + local_row) * output_stride + static_cast<int64_t>(n_tile) * 16);
+        if (has_valid_lora0) {
+          out0_pairs[local_pair] = __floats2bfloat162_rn(
+              c_smem[warp_id][tile_offset][c_offset], c_smem[warp_id][tile_offset][c_offset + 1]);
+        } else {
+          out0_pairs[local_pair] = __floats2bfloat162_rn(0.0f, 0.0f);
+        }
+      }
+    }
+
+    if (do_mma1) {
+#pragma unroll
+      for (int tile_offset = 0; tile_offset < kNTilesPerWarp; ++tile_offset) {
+        if (!has_valid_lora1_tiles[tile_offset]) {
+          continue;
+        }
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+        wmma::fill_fragment(c_frag, 0.0f);
+        wmma::mma_sync(c_frag, a_frag1, b_frags1[tile_offset], c_frag);
+        wmma::store_matrix_sync(c_smem[warp_id][tile_offset], c_frag, 16, wmma::mem_row_major);
+      }
+    }
+    __syncwarp();
+
+#pragma unroll
+    for (int tile_offset = 0; tile_offset < kNTilesPerWarp; ++tile_offset) {
+      int const n_tile = n_tile_base + tile_offset;
+      bool const valid_n_tile = valid_n_tiles[tile_offset];
+      if (!valid_n_tile) {
+        continue;
+      }
+      bool const has_valid_lora1 = has_valid_lora1_tiles[tile_offset];
+      for (int idx = lane; idx < valid_rows * 8; idx += 32) {
+        int const local_row = idx >> 3;
+        int const local_pair = idx & 7;
+        int const c_offset = local_row * 16 + local_pair * 2;
+        auto* out1_pairs = reinterpret_cast<__nv_bfloat162*>(
+            output1 + (row + local_row) * output_stride + static_cast<int64_t>(n_tile) * 16);
+        if (has_valid_lora1) {
+          out1_pairs[local_pair] = __floats2bfloat162_rn(
+              c_smem[warp_id][tile_offset][c_offset], c_smem[warp_id][tile_offset][c_offset + 1]);
+        } else {
+          out1_pairs[local_pair] = __floats2bfloat162_rn(0.0f, 0.0f);
+        }
+      }
+    }
+  }
+#endif
+}
+
+inline void loraOutput16Bf16TensorCoreGroupedDual(
+    __nv_bfloat16* output0, __nv_bfloat16* output1, __nv_bfloat16 const* low_rank_workspace0,
+    __nv_bfloat16 const* low_rank_workspace1, int64_t out_hidden_size, int64_t output_stride,
+    int num_lora_adapters, int num_experts_per_node, int32_t const* adapter_lora_ranks0,
+    void const* const* adapter_lora_weight_ptrs0, int32_t const* adapter_lora_ranks1,
+    void const* const* adapter_lora_weight_ptrs1, int32_t const* adapter_expert_row_counts,
+    int32_t const* adapter_expert_row_starts, int32_t const* no_adapter_expert_row_counts,
+    int32_t const* no_adapter_expert_row_starts, cudaStream_t stream,
+    bool zero_no_adapter_rows = true) {
+  constexpr int threads = 128;
+  constexpr int warps_per_block = 4;
+  constexpr int n_tiles_per_warp = 8;
+  int const n_tile_groups =
+      static_cast<int>(((out_hidden_size >> 4) + warps_per_block * n_tiles_per_warp - 1) /
+                       (warps_per_block * n_tiles_per_warp));
+  dim3 const grid(static_cast<unsigned int>(n_tile_groups),
+                  static_cast<unsigned int>(num_lora_adapters),
+                  static_cast<unsigned int>(num_experts_per_node));
+  loraOutput16Bf16TensorCoreGroupedDualKernel<<<grid, threads, 0, stream>>>(
+      output0, output1, low_rank_workspace0, low_rank_workspace1, out_hidden_size, output_stride,
+      num_lora_adapters, num_experts_per_node, adapter_lora_ranks0, adapter_lora_weight_ptrs0,
+      adapter_lora_ranks1, adapter_lora_weight_ptrs1, adapter_expert_row_counts,
+      adapter_expert_row_starts, no_adapter_expert_row_counts, no_adapter_expert_row_starts,
+      zero_no_adapter_rows);
+}
+
+__global__ void zeroNoAdapterGatedLoraOutputBf16Kernel(__nv_bfloat16* output, int64_t inter_size,
+                                                       int64_t output_stride,
+                                                       int32_t const* row_counts,
+                                                       int32_t const* row_starts) {
+  int64_t const out_pair = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t const out_hidden_pairs = inter_size >> 1;
+  int const expert = static_cast<int>(blockIdx.y);
+  if (out_pair >= out_hidden_pairs) {
+    return;
+  }
+  int const row_count = row_counts[expert];
+  int const row_start = row_starts[expert];
+  if (row_count <= 0 || row_start < 0) {
+    return;
+  }
+  for (int offset = 0; offset < row_count; ++offset) {
+    int64_t const row = static_cast<int64_t>(row_start) + offset;
+    auto* gated_output_pairs = reinterpret_cast<__nv_bfloat162*>(output + row * output_stride);
+    auto* fc1_output_pairs =
+        reinterpret_cast<__nv_bfloat162*>(output + row * output_stride + inter_size);
+    gated_output_pairs[out_pair] = __floats2bfloat162_rn(0.0f, 0.0f);
+    fc1_output_pairs[out_pair] = __floats2bfloat162_rn(0.0f, 0.0f);
+  }
+}
+
+inline void zeroNoAdapterGatedLoraOutputBf16(__nv_bfloat16* output, int64_t inter_size,
+                                             int64_t output_stride, int num_experts_per_node,
+                                             int32_t const* row_counts, int32_t const* row_starts,
+                                             cudaStream_t stream) {
+  constexpr int threads = 256;
+  dim3 const grid(static_cast<unsigned int>(((inter_size >> 1) + threads - 1) / threads),
+                  static_cast<unsigned int>(num_experts_per_node));
+  zeroNoAdapterGatedLoraOutputBf16Kernel<<<grid, threads, 0, stream>>>(
+      output, inter_size, output_stride, row_counts, row_starts);
+}
+
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
           bool IsMXFPX, class Enable>
 void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, Enable>::gemm2(
@@ -3250,9 +5937,10 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
     int64_t const num_rows, int64_t const expanded_num_rows, int64_t const hidden_size,
     int64_t const unpadded_hidden_size, int64_t const inter_size, int const num_experts_per_node,
     int64_t const k, float const** alpha_scale_ptr_array, bool use_lora, void* fc2_lora,
-    cudaStream_t stream, MOEParallelismConfig parallelism_config, bool const enable_alltoall,
-    cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
-    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl) {
+    int32_t const* fc2_lora_ranks, cudaStream_t stream, MOEParallelismConfig parallelism_config,
+    bool const enable_alltoall, cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
+    int* num_active_experts_per, int* active_expert_global_ids, bool defer_finalize,
+    bool enable_pdl) {
   int64_t const* total_tokens_including_expert = expert_first_token_offset + 1;
 
   bool const using_tma_ws_gemm2 = gemm_runner.isTmaWarpSpecialized(config);
@@ -3328,14 +6016,29 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
   if (min_latency_mode) return;
 
   if (use_lora && !fuse_lora_bias) {
-    auto loraBiasApplyFunc =
-        doActivation<UnfusedGemmOutputType, UnfusedGemmOutputType, ScaleBiasType>;
-    loraBiasApplyFunc(static_cast<UnfusedGemmOutputType*>(gemm_output),
-                      static_cast<UnfusedGemmOutputType const*>(gemm_output), nullptr,
-                      static_cast<ScaleBiasType const*>(fc2_lora), false, expert_first_token_offset,
-                      num_experts_per_node, hidden_size, expanded_num_rows,
-                      ActivationParams(ActivationType::Identity), {}, false, nullptr, enable_pdl,
-                      stream);
+    bool used_rank_aware_add = false;
+    if constexpr (std::is_same_v<UnfusedGemmOutputType, __nv_bfloat16> &&
+                  std::is_same_v<ScaleBiasType, __nv_bfloat16>) {
+      used_rank_aware_add =
+          fc2_lora_ranks != nullptr && expanded_num_rows >= 32768 && (hidden_size % 2 == 0);
+      if (used_rank_aware_add) {
+        addLoraBiasRankAwareBf16x2ByRow(static_cast<__nv_bfloat16*>(gemm_output),
+                                        static_cast<__nv_bfloat16 const*>(fc2_lora), fc2_lora_ranks,
+                                        expert_first_token_offset, num_experts_per_node,
+                                        expanded_num_rows, hidden_size, stream);
+      }
+    }
+
+    if (!used_rank_aware_add) {
+      auto loraBiasApplyFunc =
+          doActivation<UnfusedGemmOutputType, UnfusedGemmOutputType, ScaleBiasType>;
+      loraBiasApplyFunc(static_cast<UnfusedGemmOutputType*>(gemm_output),
+                        static_cast<UnfusedGemmOutputType const*>(gemm_output), nullptr,
+                        static_cast<ScaleBiasType const*>(fc2_lora), false,
+                        expert_first_token_offset, num_experts_per_node, hidden_size,
+                        expanded_num_rows, ActivationParams(ActivationType::Identity), {}, false,
+                        nullptr, enable_pdl, stream, nullptr);
+    }
     sync_check_cuda_error(stream);
   }
 
@@ -3343,6 +6046,10 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
   bool using_fused_finalize =
       tma_ws_input.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE;
   bool has_different_output_type_tma_ws = !using_fused_finalize && using_tma_ws_gemm2;
+
+  if (defer_finalize) {
+    return;
+  }
 
   if (has_different_output_type_ampere || has_different_output_type_tma_ws) {
     finalizeMoeRoutingKernelLauncher<OutputType, UnfusedGemmOutputType>(
@@ -3362,6 +6069,428 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
   sync_check_cuda_error(stream);
 }
 
+inline size_t loraMetadataAlign16(size_t value) { return ((value + 15) / 16) * 16; }
+
+inline char* advanceLoraMetadataWorkspace(char*& ptr, size_t size) {
+  char* out = ptr;
+  ptr += loraMetadataAlign16(size);
+  return out;
+}
+
+__device__ __forceinline__ void appendLoraAdapterExpertRow(int32_t row, int expert_idx,
+                                                           int64_t lora_idx, int num_lora_adapters,
+                                                           int row_capacity,
+                                                           int32_t* adapter_expert_row_counts,
+                                                           int32_t* adapter_expert_row_indices) {
+  if (adapter_expert_row_counts == nullptr || adapter_expert_row_indices == nullptr ||
+      row_capacity <= 0) {
+    return;
+  }
+  int const bucket = expert_idx * num_lora_adapters + static_cast<int>(lora_idx);
+  int const offset = atomicAdd(adapter_expert_row_counts + bucket, 1);
+  if (offset < row_capacity) {
+    adapter_expert_row_indices[static_cast<int64_t>(bucket) * row_capacity + offset] = row;
+  }
+}
+
+__device__ __forceinline__ void updateLoraAdapterExpertSpan(int32_t row, int expert_idx,
+                                                            int64_t lora_idx, int num_lora_adapters,
+                                                            int32_t* adapter_expert_row_counts,
+                                                            int32_t* adapter_expert_row_starts) {
+  if (adapter_expert_row_counts == nullptr || adapter_expert_row_starts == nullptr) {
+    return;
+  }
+  int const bucket = expert_idx * num_lora_adapters + static_cast<int>(lora_idx);
+  atomicAdd(adapter_expert_row_counts + bucket, 1);
+  atomicMin(adapter_expert_row_starts + bucket, row);
+}
+
+__device__ __forceinline__ void appendNoLoraAdapterExpertRow(
+    int32_t row, int expert_idx, int row_capacity, int32_t* no_adapter_expert_row_counts,
+    int32_t* no_adapter_expert_row_indices) {
+  if (no_adapter_expert_row_counts == nullptr || no_adapter_expert_row_indices == nullptr ||
+      row_capacity <= 0) {
+    return;
+  }
+  int const offset = atomicAdd(no_adapter_expert_row_counts + expert_idx, 1);
+  if (offset < row_capacity) {
+    no_adapter_expert_row_indices[static_cast<int64_t>(expert_idx) * row_capacity + offset] = row;
+  }
+}
+
+__device__ __forceinline__ void updateNoLoraAdapterExpertSpan(
+    int32_t row, int expert_idx, int32_t* no_adapter_expert_row_counts,
+    int32_t* no_adapter_expert_row_starts) {
+  if (no_adapter_expert_row_counts == nullptr || no_adapter_expert_row_starts == nullptr) {
+    return;
+  }
+  atomicAdd(no_adapter_expert_row_counts + expert_idx, 1);
+  atomicMin(no_adapter_expert_row_starts + expert_idx, row);
+}
+
+template <typename ScaleBiasType, typename TokenIndexT>
+__global__ void prepareLoraMetadataKernel(
+    int64_t expanded_num_rows, int64_t num_rows, int64_t a_expert_stride, int64_t b_expert_stride,
+    int num_lora_adapters, int max_low_rank, int64_t const* expert_first_token_offset,
+    int const* permuted_row_to_unpermuted_row, TokenIndexT const* token_lora_indices,
+    int32_t const* adapter_lora_ranks, void const* const* adapter_lora_weight_ptrs,
+    int32_t* permuted_lora_ranks, void const** permuted_lora_weight_ptrs,
+    int32_t* permuted_lora_indices, int32_t* adapter_expert_row_counts,
+    int32_t* adapter_expert_row_indices, int adapter_expert_row_capacity,
+    int32_t* adapter_expert_row_starts, bool rows_grouped_by_adapter) {
+  int const expert_idx = blockIdx.x;
+  int64_t const begin = expert_first_token_offset[expert_idx];
+  int64_t const end = expert_first_token_offset[expert_idx + 1];
+
+  for (int64_t row = begin + threadIdx.x; row < end; row += blockDim.x) {
+    if (row >= expanded_num_rows) {
+      continue;
+    }
+    int const source_index = permuted_row_to_unpermuted_row[row] % num_rows;
+    int64_t const lora_idx = static_cast<int64_t>(token_lora_indices[source_index]);
+    if (permuted_lora_indices != nullptr) {
+      permuted_lora_indices[row] =
+          (lora_idx < 0 || lora_idx >= num_lora_adapters) ? -1 : static_cast<int32_t>(lora_idx);
+    }
+    if (lora_idx < 0 || lora_idx >= num_lora_adapters) {
+      permuted_lora_ranks[row] = 0;
+      continue;
+    }
+
+    int32_t lora_rank = adapter_lora_ranks[lora_idx];
+    if (lora_rank <= 0) {
+      permuted_lora_ranks[row] = 0;
+      continue;
+    }
+    if (lora_rank > max_low_rank) {
+      lora_rank = max_low_rank;
+    }
+
+    auto const* lora_a =
+        reinterpret_cast<ScaleBiasType const*>(adapter_lora_weight_ptrs[lora_idx * 2]);
+    auto const* lora_b =
+        reinterpret_cast<ScaleBiasType const*>(adapter_lora_weight_ptrs[lora_idx * 2 + 1]);
+    if (lora_a == nullptr || lora_b == nullptr) {
+      permuted_lora_ranks[row] = 0;
+      continue;
+    }
+
+    permuted_lora_ranks[row] = lora_rank;
+    permuted_lora_weight_ptrs[row * 2] =
+        lora_a + static_cast<size_t>(expert_idx) * static_cast<size_t>(a_expert_stride);
+    permuted_lora_weight_ptrs[row * 2 + 1] =
+        lora_b + static_cast<size_t>(expert_idx) * static_cast<size_t>(b_expert_stride);
+    if (rows_grouped_by_adapter) {
+      updateLoraAdapterExpertSpan(static_cast<int32_t>(row), expert_idx, lora_idx,
+                                  num_lora_adapters, adapter_expert_row_counts,
+                                  adapter_expert_row_starts);
+    } else {
+      appendLoraAdapterExpertRow(static_cast<int32_t>(row), expert_idx, lora_idx, num_lora_adapters,
+                                 adapter_expert_row_capacity, adapter_expert_row_counts,
+                                 adapter_expert_row_indices);
+    }
+  }
+}
+
+__device__ __forceinline__ void clearLoraMetadataEntry(int64_t row, int32_t* ranks,
+                                                       void const** ptrs) {
+  ranks[row] = 0;
+  ptrs[row * 2] = nullptr;
+  ptrs[row * 2 + 1] = nullptr;
+}
+
+template <typename ScaleBiasType>
+__device__ __forceinline__ void fillLoraMetadataEntry(int64_t row, int expert_idx, int64_t lora_idx,
+                                                      int64_t a_expert_stride,
+                                                      int64_t b_expert_stride, int max_low_rank,
+                                                      int32_t const* adapter_lora_ranks,
+                                                      void const* const* adapter_lora_weight_ptrs,
+                                                      int32_t* permuted_lora_ranks,
+                                                      void const** permuted_lora_weight_ptrs) {
+  int32_t lora_rank = adapter_lora_ranks[lora_idx];
+  if (lora_rank <= 0) {
+    clearLoraMetadataEntry(row, permuted_lora_ranks, permuted_lora_weight_ptrs);
+    return;
+  }
+  if (lora_rank > max_low_rank) {
+    lora_rank = max_low_rank;
+  }
+
+  auto const* lora_a =
+      reinterpret_cast<ScaleBiasType const*>(adapter_lora_weight_ptrs[lora_idx * 2]);
+  auto const* lora_b =
+      reinterpret_cast<ScaleBiasType const*>(adapter_lora_weight_ptrs[lora_idx * 2 + 1]);
+  if (lora_a == nullptr || lora_b == nullptr) {
+    clearLoraMetadataEntry(row, permuted_lora_ranks, permuted_lora_weight_ptrs);
+    return;
+  }
+
+  permuted_lora_ranks[row] = lora_rank;
+  permuted_lora_weight_ptrs[row * 2] =
+      lora_a + static_cast<size_t>(expert_idx) * static_cast<size_t>(a_expert_stride);
+  permuted_lora_weight_ptrs[row * 2 + 1] =
+      lora_b + static_cast<size_t>(expert_idx) * static_cast<size_t>(b_expert_stride);
+}
+
+template <typename ScaleBiasType, typename TokenIndexT>
+__global__ void prepareGatedLoraMetadataKernel(
+    int64_t expanded_num_rows, int64_t num_rows, int64_t fc1_a_expert_stride,
+    int64_t fc1_b_expert_stride, int64_t fc2_a_expert_stride, int64_t fc2_b_expert_stride,
+    int num_lora_adapters, int max_low_rank, int64_t const* expert_first_token_offset,
+    int const* permuted_row_to_unpermuted_row, TokenIndexT const* token_lora_indices,
+    int32_t const* fc1_lora_ranks, void const* const* fc1_lora_weight_ptrs,
+    int32_t const* fc2_lora_ranks, void const* const* fc2_lora_weight_ptrs,
+    int32_t const* gated_lora_ranks, void const* const* gated_lora_weight_ptrs,
+    int32_t* permuted_fc1_lora_ranks, void const** permuted_fc1_lora_weight_ptrs,
+    int32_t* permuted_fc2_lora_ranks, void const** permuted_fc2_lora_weight_ptrs,
+    int32_t* permuted_gated_lora_ranks, void const** permuted_gated_lora_weight_ptrs,
+    int32_t* permuted_lora_indices, int32_t* adapter_expert_row_counts,
+    int32_t* adapter_expert_row_indices, int adapter_expert_row_capacity,
+    int32_t* adapter_expert_row_starts, bool rows_grouped_by_adapter,
+    int32_t* no_adapter_expert_row_counts, int32_t* no_adapter_expert_row_indices,
+    int no_adapter_expert_row_capacity, int32_t* no_adapter_expert_row_starts,
+    int32_t* fc1_gated_lora_has_missing_rows) {
+  int const expert_idx = blockIdx.x;
+  int64_t const begin = expert_first_token_offset[expert_idx];
+  int64_t const end = expert_first_token_offset[expert_idx + 1];
+
+  for (int64_t row = begin + threadIdx.x; row < end; row += blockDim.x) {
+    if (row >= expanded_num_rows) {
+      continue;
+    }
+
+    int const source_index = permuted_row_to_unpermuted_row[row] % num_rows;
+    int64_t const lora_idx = static_cast<int64_t>(token_lora_indices[source_index]);
+    if (permuted_lora_indices != nullptr) {
+      permuted_lora_indices[row] =
+          (lora_idx < 0 || lora_idx >= num_lora_adapters) ? -1 : static_cast<int32_t>(lora_idx);
+    }
+    if (lora_idx < 0 || lora_idx >= num_lora_adapters) {
+      clearLoraMetadataEntry(row, permuted_fc1_lora_ranks, permuted_fc1_lora_weight_ptrs);
+      clearLoraMetadataEntry(row, permuted_fc2_lora_ranks, permuted_fc2_lora_weight_ptrs);
+      clearLoraMetadataEntry(row, permuted_gated_lora_ranks, permuted_gated_lora_weight_ptrs);
+      if (rows_grouped_by_adapter) {
+        updateNoLoraAdapterExpertSpan(static_cast<int32_t>(row), expert_idx,
+                                      no_adapter_expert_row_counts, no_adapter_expert_row_starts);
+      } else {
+        appendNoLoraAdapterExpertRow(static_cast<int32_t>(row), expert_idx,
+                                     no_adapter_expert_row_capacity, no_adapter_expert_row_counts,
+                                     no_adapter_expert_row_indices);
+      }
+      continue;
+    }
+
+    fillLoraMetadataEntry<ScaleBiasType>(row, expert_idx, lora_idx, fc1_a_expert_stride,
+                                         fc1_b_expert_stride, max_low_rank, fc1_lora_ranks,
+                                         fc1_lora_weight_ptrs, permuted_fc1_lora_ranks,
+                                         permuted_fc1_lora_weight_ptrs);
+    fillLoraMetadataEntry<ScaleBiasType>(row, expert_idx, lora_idx, fc2_a_expert_stride,
+                                         fc2_b_expert_stride, max_low_rank, fc2_lora_ranks,
+                                         fc2_lora_weight_ptrs, permuted_fc2_lora_ranks,
+                                         permuted_fc2_lora_weight_ptrs);
+    fillLoraMetadataEntry<ScaleBiasType>(row, expert_idx, lora_idx, fc1_a_expert_stride,
+                                         fc1_b_expert_stride, max_low_rank, gated_lora_ranks,
+                                         gated_lora_weight_ptrs, permuted_gated_lora_ranks,
+                                         permuted_gated_lora_weight_ptrs);
+    if (fc1_gated_lora_has_missing_rows != nullptr &&
+        (permuted_gated_lora_weight_ptrs[row * 2 + 1] == nullptr ||
+         permuted_fc1_lora_weight_ptrs[row * 2 + 1] == nullptr)) {
+      atomicExch(fc1_gated_lora_has_missing_rows, 1);
+    }
+    if (permuted_fc1_lora_ranks[row] > 0 || permuted_fc2_lora_ranks[row] > 0 ||
+        permuted_gated_lora_ranks[row] > 0) {
+      if (rows_grouped_by_adapter) {
+        updateLoraAdapterExpertSpan(static_cast<int32_t>(row), expert_idx, lora_idx,
+                                    num_lora_adapters, adapter_expert_row_counts,
+                                    adapter_expert_row_starts);
+      } else {
+        appendLoraAdapterExpertRow(static_cast<int32_t>(row), expert_idx, lora_idx,
+                                   num_lora_adapters, adapter_expert_row_capacity,
+                                   adapter_expert_row_counts, adapter_expert_row_indices);
+      }
+    }
+  }
+}
+
+template <typename ScaleBiasType>
+void prepareLoraMetadata(int64_t expanded_num_rows, int64_t num_rows, int64_t a_expert_stride,
+                         int64_t b_expert_stride, int num_lora_adapters, int max_low_rank,
+                         int num_experts_per_node, int64_t const* expert_first_token_offset,
+                         int const* permuted_row_to_unpermuted_row, void const* token_lora_indices,
+                         bool token_lora_indices_is_int64, int32_t const* adapter_lora_ranks,
+                         void const* const* adapter_lora_weight_ptrs, int32_t* permuted_lora_ranks,
+                         void const** permuted_lora_weight_ptrs, int32_t* permuted_lora_indices,
+                         int32_t* adapter_expert_row_counts, int32_t* adapter_expert_row_indices,
+                         int adapter_expert_row_capacity, int32_t* adapter_expert_row_starts,
+                         bool rows_grouped_by_adapter, cudaStream_t stream) {
+  TLLM_CUDA_CHECK(
+      cudaMemsetAsync(permuted_lora_ranks, 0, expanded_num_rows * sizeof(int32_t), stream));
+  constexpr int threads = 256;
+  if (token_lora_indices_is_int64) {
+    prepareLoraMetadataKernel<ScaleBiasType, int64_t><<<num_experts_per_node, threads, 0, stream>>>(
+        expanded_num_rows, num_rows, a_expert_stride, b_expert_stride, num_lora_adapters,
+        max_low_rank, expert_first_token_offset, permuted_row_to_unpermuted_row,
+        static_cast<int64_t const*>(token_lora_indices), adapter_lora_ranks,
+        adapter_lora_weight_ptrs, permuted_lora_ranks, permuted_lora_weight_ptrs,
+        permuted_lora_indices, adapter_expert_row_counts, adapter_expert_row_indices,
+        adapter_expert_row_capacity, adapter_expert_row_starts, rows_grouped_by_adapter);
+  } else {
+    prepareLoraMetadataKernel<ScaleBiasType, int32_t><<<num_experts_per_node, threads, 0, stream>>>(
+        expanded_num_rows, num_rows, a_expert_stride, b_expert_stride, num_lora_adapters,
+        max_low_rank, expert_first_token_offset, permuted_row_to_unpermuted_row,
+        static_cast<int32_t const*>(token_lora_indices), adapter_lora_ranks,
+        adapter_lora_weight_ptrs, permuted_lora_ranks, permuted_lora_weight_ptrs,
+        permuted_lora_indices, adapter_expert_row_counts, adapter_expert_row_indices,
+        adapter_expert_row_capacity, adapter_expert_row_starts, rows_grouped_by_adapter);
+  }
+}
+
+template <typename ScaleBiasType>
+void prepareGatedLoraMetadata(
+    int64_t expanded_num_rows, int64_t num_rows, int64_t fc1_a_expert_stride,
+    int64_t fc1_b_expert_stride, int64_t fc2_a_expert_stride, int64_t fc2_b_expert_stride,
+    int num_lora_adapters, int max_low_rank, int num_experts_per_node,
+    int64_t const* expert_first_token_offset, int const* permuted_row_to_unpermuted_row,
+    void const* token_lora_indices, bool token_lora_indices_is_int64, int32_t const* fc1_lora_ranks,
+    void const* const* fc1_lora_weight_ptrs, int32_t const* fc2_lora_ranks,
+    void const* const* fc2_lora_weight_ptrs, int32_t const* gated_lora_ranks,
+    void const* const* gated_lora_weight_ptrs, int32_t* permuted_fc1_lora_ranks,
+    void const** permuted_fc1_lora_weight_ptrs, int32_t* permuted_fc2_lora_ranks,
+    void const** permuted_fc2_lora_weight_ptrs, int32_t* permuted_gated_lora_ranks,
+    void const** permuted_gated_lora_weight_ptrs, int32_t* permuted_lora_indices,
+    int32_t* adapter_expert_row_counts, int32_t* adapter_expert_row_indices,
+    int adapter_expert_row_capacity, int32_t* adapter_expert_row_starts,
+    bool rows_grouped_by_adapter, int32_t* no_adapter_expert_row_counts,
+    int32_t* no_adapter_expert_row_indices, int no_adapter_expert_row_capacity,
+    int32_t* no_adapter_expert_row_starts, int32_t* fc1_gated_lora_has_missing_rows,
+    cudaStream_t stream) {
+  constexpr int threads = 256;
+  if (token_lora_indices_is_int64) {
+    prepareGatedLoraMetadataKernel<ScaleBiasType, int64_t>
+        <<<num_experts_per_node, threads, 0, stream>>>(
+            expanded_num_rows, num_rows, fc1_a_expert_stride, fc1_b_expert_stride,
+            fc2_a_expert_stride, fc2_b_expert_stride, num_lora_adapters, max_low_rank,
+            expert_first_token_offset, permuted_row_to_unpermuted_row,
+            static_cast<int64_t const*>(token_lora_indices), fc1_lora_ranks, fc1_lora_weight_ptrs,
+            fc2_lora_ranks, fc2_lora_weight_ptrs, gated_lora_ranks, gated_lora_weight_ptrs,
+            permuted_fc1_lora_ranks, permuted_fc1_lora_weight_ptrs, permuted_fc2_lora_ranks,
+            permuted_fc2_lora_weight_ptrs, permuted_gated_lora_ranks,
+            permuted_gated_lora_weight_ptrs, permuted_lora_indices, adapter_expert_row_counts,
+            adapter_expert_row_indices, adapter_expert_row_capacity, adapter_expert_row_starts,
+            rows_grouped_by_adapter, no_adapter_expert_row_counts, no_adapter_expert_row_indices,
+            no_adapter_expert_row_capacity, no_adapter_expert_row_starts,
+            fc1_gated_lora_has_missing_rows);
+  } else {
+    prepareGatedLoraMetadataKernel<ScaleBiasType, int32_t>
+        <<<num_experts_per_node, threads, 0, stream>>>(
+            expanded_num_rows, num_rows, fc1_a_expert_stride, fc1_b_expert_stride,
+            fc2_a_expert_stride, fc2_b_expert_stride, num_lora_adapters, max_low_rank,
+            expert_first_token_offset, permuted_row_to_unpermuted_row,
+            static_cast<int32_t const*>(token_lora_indices), fc1_lora_ranks, fc1_lora_weight_ptrs,
+            fc2_lora_ranks, fc2_lora_weight_ptrs, gated_lora_ranks, gated_lora_weight_ptrs,
+            permuted_fc1_lora_ranks, permuted_fc1_lora_weight_ptrs, permuted_fc2_lora_ranks,
+            permuted_fc2_lora_weight_ptrs, permuted_gated_lora_ranks,
+            permuted_gated_lora_weight_ptrs, permuted_lora_indices, adapter_expert_row_counts,
+            adapter_expert_row_indices, adapter_expert_row_capacity, adapter_expert_row_starts,
+            rows_grouped_by_adapter, no_adapter_expert_row_counts, no_adapter_expert_row_indices,
+            no_adapter_expert_row_capacity, no_adapter_expert_row_starts,
+            fc1_gated_lora_has_missing_rows);
+  }
+}
+
+__global__ void prepareGroupedGatedLoraFastMetadataKernel(
+    int64_t expanded_num_rows, int num_experts_per_node, int num_lora_adapters, int max_low_rank,
+    int const* adapter_bucket_counts, int const* adapter_bucket_offsets,
+    int32_t const* fc2_lora_ranks, void const* const* fc2_lora_weight_ptrs,
+    int32_t const* fc1_lora_ranks, void const* const* fc1_lora_weight_ptrs,
+    int32_t const* gated_lora_ranks, void const* const* gated_lora_weight_ptrs,
+    int32_t* permuted_fc2_lora_ranks, int32_t* permuted_fc1_gated_lora_bias_ranks,
+    int32_t* adapter_expert_row_counts, int32_t* adapter_expert_row_starts,
+    int32_t* no_adapter_expert_row_counts, int32_t* no_adapter_expert_row_starts,
+    int32_t* fc1_gated_lora_has_missing_rows) {
+  int const expert = static_cast<int>(blockIdx.x);
+  int const bucket = static_cast<int>(blockIdx.y);
+  int const adapter_bucket_count = num_lora_adapters + 1;
+  if (expert >= num_experts_per_node || bucket >= adapter_bucket_count) {
+    return;
+  }
+
+  int const src = expert * adapter_bucket_count + bucket;
+  int const row_count = adapter_bucket_counts[src];
+  int const row_start = adapter_bucket_offsets[src];
+
+  int rank = 0;
+  int fc1_gated_bias_rank = 0;
+  if (bucket > 0) {
+    int const adapter = bucket - 1;
+    int32_t const raw_rank = fc2_lora_ranks[adapter];
+    auto const* lora_a = fc2_lora_weight_ptrs[adapter * 2];
+    auto const* lora_b = fc2_lora_weight_ptrs[adapter * 2 + 1];
+    rank = (raw_rank > 0 && lora_a != nullptr && lora_b != nullptr)
+               ? (raw_rank < max_low_rank ? raw_rank : max_low_rank)
+               : 0;
+    bool const has_fc1_lora = fc1_lora_ranks != nullptr && fc1_lora_weight_ptrs != nullptr &&
+                              fc1_lora_ranks[adapter] > 0 &&
+                              fc1_lora_weight_ptrs[adapter * 2] != nullptr &&
+                              fc1_lora_weight_ptrs[adapter * 2 + 1] != nullptr;
+    bool const has_gated_lora = gated_lora_ranks != nullptr && gated_lora_weight_ptrs != nullptr &&
+                                gated_lora_ranks[adapter] > 0 &&
+                                gated_lora_weight_ptrs[adapter * 2] != nullptr &&
+                                gated_lora_weight_ptrs[adapter * 2 + 1] != nullptr;
+    fc1_gated_bias_rank = (has_fc1_lora || has_gated_lora) ? 1 : 0;
+    if (threadIdx.x == 0 && adapter_expert_row_counts != nullptr &&
+        adapter_expert_row_starts != nullptr) {
+      int const dst = expert * num_lora_adapters + adapter;
+      adapter_expert_row_counts[dst] = row_count;
+      adapter_expert_row_starts[dst] = row_count > 0 ? row_start : 0x7f7f7f7f;
+    }
+  } else if (threadIdx.x == 0 && no_adapter_expert_row_counts != nullptr &&
+             no_adapter_expert_row_starts != nullptr) {
+    no_adapter_expert_row_counts[expert] = row_count;
+    no_adapter_expert_row_starts[expert] = row_count > 0 ? row_start : 0x7f7f7f7f;
+  }
+
+  if ((permuted_fc2_lora_ranks != nullptr || permuted_fc1_gated_lora_bias_ranks != nullptr) &&
+      row_count > 0 && row_start >= 0) {
+    int64_t const begin = static_cast<int64_t>(row_start);
+    int64_t const end = min(begin + static_cast<int64_t>(row_count), expanded_num_rows);
+    for (int64_t row = begin + threadIdx.x; row < end; row += blockDim.x) {
+      if (permuted_fc2_lora_ranks != nullptr) {
+        permuted_fc2_lora_ranks[row] = rank;
+      }
+      if (permuted_fc1_gated_lora_bias_ranks != nullptr) {
+        permuted_fc1_gated_lora_bias_ranks[row] = fc1_gated_bias_rank;
+      }
+    }
+  }
+
+  if (threadIdx.x == 0 && fc1_gated_lora_has_missing_rows != nullptr) {
+    *fc1_gated_lora_has_missing_rows = 0;
+  }
+}
+
+void prepareGroupedGatedLoraFastMetadata(
+    int64_t expanded_num_rows, int num_experts_per_node, int num_lora_adapters, int max_low_rank,
+    int const* adapter_bucket_counts, int const* adapter_bucket_offsets,
+    int32_t const* fc2_lora_ranks, void const* const* fc2_lora_weight_ptrs,
+    int32_t const* fc1_lora_ranks, void const* const* fc1_lora_weight_ptrs,
+    int32_t const* gated_lora_ranks, void const* const* gated_lora_weight_ptrs,
+    int32_t* permuted_fc2_lora_ranks, int32_t* permuted_fc1_gated_lora_bias_ranks,
+    int32_t* adapter_expert_row_counts, int32_t* adapter_expert_row_starts,
+    int32_t* no_adapter_expert_row_counts, int32_t* no_adapter_expert_row_starts,
+    int32_t* fc1_gated_lora_has_missing_rows, cudaStream_t stream) {
+  constexpr int threads = 256;
+  dim3 const grid(static_cast<unsigned int>(num_experts_per_node),
+                  static_cast<unsigned int>(num_lora_adapters + 1));
+  prepareGroupedGatedLoraFastMetadataKernel<<<grid, threads, 0, stream>>>(
+      expanded_num_rows, num_experts_per_node, num_lora_adapters, max_low_rank,
+      adapter_bucket_counts, adapter_bucket_offsets, fc2_lora_ranks, fc2_lora_weight_ptrs,
+      fc1_lora_ranks, fc1_lora_weight_ptrs, gated_lora_ranks, gated_lora_weight_ptrs,
+      permuted_fc2_lora_ranks, permuted_fc1_gated_lora_bias_ranks, adapter_expert_row_counts,
+      adapter_expert_row_starts, no_adapter_expert_row_counts, no_adapter_expert_row_starts,
+      fc1_gated_lora_has_missing_rows);
+}
+
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
           bool IsMXFPX, class Enable>
 bool CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
@@ -3369,91 +6498,186 @@ bool CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
                                                     int64_t inter_size, int64_t hidden_size,
                                                     int start_expert, bool is_gated_activation,
                                                     int num_experts_per_node, bool needs_num_valid,
-                                                    LoraParams& lora_params, cudaStream_t stream) {
-  std::vector<int>& host_permuted_rows = host_lora_workspace_.host_permuted_rows;
-  std::vector<void const*>& host_permuted_fc1_weight_ptrs =
-      host_lora_workspace_.host_permuted_fc1_weight_ptrs;
-  std::vector<void const*>& host_permuted_fc2_weight_ptrs =
-      host_lora_workspace_.host_permuted_fc2_weight_ptrs;
-  std::vector<void const*>& host_permuted_gated_weight_ptrs =
-      host_lora_workspace_.host_permuted_gated_weight_ptrs;
+                                                    LoraParams& lora_params,
+                                                    bool use_grouped_lora_metadata_fast_path,
+                                                    cudaStream_t stream) {
+  TLLM_CHECK_WITH_INFO(!needs_num_valid && start_expert == 0,
+                       "LoRA metadata setup does not support expert parallelism yet");
+  TLLM_CHECK_WITH_INFO(lora_params.metadata_workspace != nullptr,
+                       "LoRA metadata workspace must not be null");
+  TLLM_CHECK_WITH_INFO(lora_params.token_lora_indices != nullptr,
+                       "LoRA token mapping must not be null");
+  TLLM_CHECK_WITH_INFO(lora_params.max_low_rank > 0, "LoRA max rank must be positive");
+  TLLM_CHECK_WITH_INFO(lora_params.num_lora_adapters > 0, "LoRA adapter count must be positive");
 
-  std::vector<int32_t>& host_permuted_fc1_lora_ranks =
-      host_lora_workspace_.host_permuted_fc1_lora_ranks;
-  std::vector<int32_t>& host_permuted_fc2_lora_ranks =
-      host_lora_workspace_.host_permuted_fc2_lora_ranks;
-  std::vector<int32_t>& host_permuted_gated_lora_ranks =
-      host_lora_workspace_.host_permuted_gated_lora_ranks;
-  std::vector<int64_t>& host_expert_first_token_offset =
-      host_lora_workspace_.host_expert_first_token_offset;
+  char* metadata_ptr = static_cast<char*>(lora_params.metadata_workspace);
+  auto allocateRanks = [&](int64_t entries) {
+    return reinterpret_cast<int32_t*>(
+        advanceLoraMetadataWorkspace(metadata_ptr, entries * sizeof(int32_t)));
+  };
+  auto allocatePtrs = [&](int64_t entries) {
+    return reinterpret_cast<void const**>(
+        advanceLoraMetadataWorkspace(metadata_ptr, entries * 2 * sizeof(void const*)));
+  };
+  int64_t const adapter_expert_buckets =
+      static_cast<int64_t>(lora_params.num_lora_adapters) * num_experts_per_node;
+  bool const rows_grouped_by_adapter = lora_params.rows_grouped_by_adapter;
+  bool use_fast_grouped_metadata = false;
+  if constexpr (std::is_same_v<ScaleBiasType, __nv_bfloat16>) {
+    use_fast_grouped_metadata = use_grouped_lora_metadata_fast_path && is_gated_activation &&
+                                rows_grouped_by_adapter && lora_params.max_low_rank == 16 &&
+                                expanded_num_rows >= 1024 && hidden_size % 16 == 0 &&
+                                inter_size % 16 == 0;
+  }
 
-  bool all_token_without_lora = true;
+  if (use_fast_grouped_metadata) {
+    TLLM_CHECK(blocked_expert_counts_ != nullptr);
+    TLLM_CHECK(blocked_expert_counts_cumsum_ != nullptr);
+  }
 
-  host_permuted_fc1_weight_ptrs.resize(expanded_num_rows * 2);
-  host_permuted_fc1_lora_ranks.resize(expanded_num_rows);
-  host_permuted_fc2_weight_ptrs.resize(expanded_num_rows * 2);
-  host_permuted_fc2_lora_ranks.resize(expanded_num_rows);
+  lora_params.adapter_expert_row_counts = reinterpret_cast<int32_t*>(
+      advanceLoraMetadataWorkspace(metadata_ptr, adapter_expert_buckets * sizeof(int32_t)));
+  lora_params.adapter_expert_row_starts = reinterpret_cast<int32_t*>(
+      advanceLoraMetadataWorkspace(metadata_ptr, adapter_expert_buckets * sizeof(int32_t)));
+  if (use_fast_grouped_metadata) {
+    lora_params.adapter_expert_row_capacity = 0;
+    lora_params.adapter_expert_row_indices = nullptr;
+  } else {
+    lora_params.adapter_expert_row_capacity = static_cast<int>(num_rows);
+    lora_params.adapter_expert_row_indices =
+        reinterpret_cast<int32_t*>(advanceLoraMetadataWorkspace(
+            metadata_ptr, adapter_expert_buckets * num_rows * sizeof(int32_t)));
+    TLLM_CUDA_CHECK(cudaMemsetAsync(lora_params.adapter_expert_row_counts, 0,
+                                    adapter_expert_buckets * sizeof(int32_t), stream));
+    TLLM_CUDA_CHECK(cudaMemsetAsync(lora_params.adapter_expert_row_starts, 0x7f,
+                                    adapter_expert_buckets * sizeof(int32_t), stream));
+  }
+
+  bool const needs_fc1_no_adapter_row_list =
+      is_gated_activation && lora_params.max_low_rank == 16 && expanded_num_rows >= 1024 &&
+      (inter_size % 2 == 0);
+  if (needs_fc1_no_adapter_row_list) {
+    lora_params.no_adapter_expert_row_counts =
+        reinterpret_cast<int32_t*>(advanceLoraMetadataWorkspace(
+            metadata_ptr, static_cast<int64_t>(num_experts_per_node) * sizeof(int32_t)));
+    lora_params.no_adapter_expert_row_starts =
+        reinterpret_cast<int32_t*>(advanceLoraMetadataWorkspace(
+            metadata_ptr, static_cast<int64_t>(num_experts_per_node) * sizeof(int32_t)));
+    if (use_fast_grouped_metadata) {
+      lora_params.no_adapter_expert_row_capacity = 0;
+      lora_params.no_adapter_expert_row_indices = nullptr;
+    } else {
+      lora_params.no_adapter_expert_row_capacity = static_cast<int>(num_rows);
+      lora_params.no_adapter_expert_row_indices = reinterpret_cast<int32_t*>(
+          advanceLoraMetadataWorkspace(metadata_ptr, static_cast<int64_t>(num_experts_per_node) *
+                                                         num_rows * sizeof(int32_t)));
+    }
+    lora_params.fc1_gated_lora_has_missing_rows =
+        reinterpret_cast<int32_t*>(advanceLoraMetadataWorkspace(metadata_ptr, sizeof(int32_t)));
+    if (!use_fast_grouped_metadata) {
+      TLLM_CUDA_CHECK(cudaMemsetAsync(lora_params.no_adapter_expert_row_counts, 0,
+                                      static_cast<int64_t>(num_experts_per_node) * sizeof(int32_t),
+                                      stream));
+      TLLM_CUDA_CHECK(cudaMemsetAsync(lora_params.no_adapter_expert_row_starts, 0x7f,
+                                      static_cast<int64_t>(num_experts_per_node) * sizeof(int32_t),
+                                      stream));
+      TLLM_CUDA_CHECK(
+          cudaMemsetAsync(lora_params.fc1_gated_lora_has_missing_rows, 0, sizeof(int32_t), stream));
+    }
+  } else {
+    lora_params.no_adapter_expert_row_counts = nullptr;
+    lora_params.no_adapter_expert_row_indices = nullptr;
+    lora_params.no_adapter_expert_row_capacity = 0;
+    lora_params.no_adapter_expert_row_starts = nullptr;
+    lora_params.fc1_gated_lora_has_missing_rows = nullptr;
+  }
+
+  lora_params.permuted_fc1_gated_lora_bias_ranks =
+      use_fast_grouped_metadata ? allocateRanks(expanded_num_rows) : nullptr;
+
+  if (is_gated_activation && !use_fast_grouped_metadata) {
+    auto* permuted_fc1_gated_lora_ranks = allocateRanks(2 * expanded_num_rows);
+    auto* permuted_fc1_gated_lora_weight_ptrs = allocatePtrs(2 * expanded_num_rows);
+    lora_params.permuted_gated_lora_ranks = permuted_fc1_gated_lora_ranks;
+    lora_params.permuted_gated_lora_weight_ptrs = permuted_fc1_gated_lora_weight_ptrs;
+    lora_params.permuted_fc1_lora_ranks = permuted_fc1_gated_lora_ranks + expanded_num_rows;
+    lora_params.permuted_fc1_lora_weight_ptrs =
+        permuted_fc1_gated_lora_weight_ptrs + expanded_num_rows * 2;
+  } else if (!is_gated_activation) {
+    lora_params.permuted_fc1_lora_ranks = allocateRanks(expanded_num_rows);
+    lora_params.permuted_fc1_lora_weight_ptrs = allocatePtrs(expanded_num_rows);
+  } else {
+    lora_params.permuted_gated_lora_ranks = nullptr;
+    lora_params.permuted_gated_lora_weight_ptrs = nullptr;
+    lora_params.permuted_fc1_lora_ranks = nullptr;
+    lora_params.permuted_fc1_lora_weight_ptrs = nullptr;
+  }
+  lora_params.permuted_fc2_lora_ranks = allocateRanks(expanded_num_rows);
+  lora_params.permuted_fc2_lora_weight_ptrs =
+      use_fast_grouped_metadata ? nullptr : allocatePtrs(expanded_num_rows);
+
+  int64_t const fc1_a_expert_stride = hidden_size * lora_params.max_low_rank;
+  int64_t const fc1_b_expert_stride = inter_size * lora_params.max_low_rank;
+  int64_t const fc2_a_expert_stride = inter_size * lora_params.max_low_rank;
+  int64_t const fc2_b_expert_stride = hidden_size * lora_params.max_low_rank;
+
+  if (use_fast_grouped_metadata) {
+    lora_params.permuted_lora_indices = nullptr;
+    prepareGroupedGatedLoraFastMetadata(
+        expanded_num_rows, num_experts_per_node, lora_params.num_lora_adapters,
+        lora_params.max_low_rank, blocked_expert_counts_, blocked_expert_counts_cumsum_,
+        lora_params.fc2_lora_ranks, lora_params.fc2_lora_weight_ptrs, lora_params.fc1_lora_ranks,
+        lora_params.fc1_lora_weight_ptrs, lora_params.gated_lora_ranks,
+        lora_params.gated_lora_weight_ptrs, lora_params.permuted_fc2_lora_ranks,
+        lora_params.permuted_fc1_gated_lora_bias_ranks, lora_params.adapter_expert_row_counts,
+        lora_params.adapter_expert_row_starts, lora_params.no_adapter_expert_row_counts,
+        lora_params.no_adapter_expert_row_starts, lora_params.fc1_gated_lora_has_missing_rows,
+        stream);
+    return false;
+  }
+
+  lora_params.permuted_lora_indices = reinterpret_cast<int32_t*>(
+      advanceLoraMetadataWorkspace(metadata_ptr, expanded_num_rows * sizeof(int32_t)));
 
   if (is_gated_activation) {
-    host_permuted_gated_weight_ptrs.resize(expanded_num_rows * 2);
-    host_permuted_gated_lora_ranks.resize(expanded_num_rows);
+    prepareGatedLoraMetadata<ScaleBiasType>(
+        expanded_num_rows, num_rows, fc1_a_expert_stride, fc1_b_expert_stride, fc2_a_expert_stride,
+        fc2_b_expert_stride, lora_params.num_lora_adapters, lora_params.max_low_rank,
+        num_experts_per_node, expert_first_token_offset_, permuted_row_to_unpermuted_row_,
+        lora_params.token_lora_indices, lora_params.token_lora_indices_is_int64,
+        lora_params.fc1_lora_ranks, lora_params.fc1_lora_weight_ptrs, lora_params.fc2_lora_ranks,
+        lora_params.fc2_lora_weight_ptrs, lora_params.gated_lora_ranks,
+        lora_params.gated_lora_weight_ptrs, lora_params.permuted_fc1_lora_ranks,
+        lora_params.permuted_fc1_lora_weight_ptrs, lora_params.permuted_fc2_lora_ranks,
+        lora_params.permuted_fc2_lora_weight_ptrs, lora_params.permuted_gated_lora_ranks,
+        lora_params.permuted_gated_lora_weight_ptrs, lora_params.permuted_lora_indices,
+        lora_params.adapter_expert_row_counts, lora_params.adapter_expert_row_indices,
+        lora_params.adapter_expert_row_capacity, lora_params.adapter_expert_row_starts,
+        lora_params.rows_grouped_by_adapter, lora_params.no_adapter_expert_row_counts,
+        lora_params.no_adapter_expert_row_indices, lora_params.no_adapter_expert_row_capacity,
+        lora_params.no_adapter_expert_row_starts, lora_params.fc1_gated_lora_has_missing_rows,
+        stream);
+  } else {
+    prepareLoraMetadata<ScaleBiasType>(
+        expanded_num_rows, num_rows, fc1_a_expert_stride, fc1_b_expert_stride,
+        lora_params.num_lora_adapters, lora_params.max_low_rank, num_experts_per_node,
+        expert_first_token_offset_, permuted_row_to_unpermuted_row_, lora_params.token_lora_indices,
+        lora_params.token_lora_indices_is_int64, lora_params.fc1_lora_ranks,
+        lora_params.fc1_lora_weight_ptrs, lora_params.permuted_fc1_lora_ranks,
+        lora_params.permuted_fc1_lora_weight_ptrs, lora_params.permuted_lora_indices, nullptr,
+        nullptr, 0, nullptr, false, stream);
+    prepareLoraMetadata<ScaleBiasType>(
+        expanded_num_rows, num_rows, fc2_a_expert_stride, fc2_b_expert_stride,
+        lora_params.num_lora_adapters, lora_params.max_low_rank, num_experts_per_node,
+        expert_first_token_offset_, permuted_row_to_unpermuted_row_, lora_params.token_lora_indices,
+        lora_params.token_lora_indices_is_int64, lora_params.fc2_lora_ranks,
+        lora_params.fc2_lora_weight_ptrs, lora_params.permuted_fc2_lora_ranks,
+        lora_params.permuted_fc2_lora_weight_ptrs, nullptr, lora_params.adapter_expert_row_counts,
+        lora_params.adapter_expert_row_indices, lora_params.adapter_expert_row_capacity,
+        lora_params.adapter_expert_row_starts, lora_params.rows_grouped_by_adapter, stream);
   }
 
-  TLLM_CUDA_CHECK(cudaEventSynchronize(*(lora_params.memcpy_event_ptr)));
-
-  size_t num_valid_tokens =
-      needs_num_valid ? host_expert_first_token_offset[num_experts_per_node] : expanded_num_rows;
-
-  for (int expert_idx = 0; expert_idx < num_experts_per_node; ++expert_idx) {
-    int weight_index = expert_idx + start_expert;
-    for (size_t i = host_expert_first_token_offset[expert_idx];
-         i < host_expert_first_token_offset[expert_idx + 1]; ++i) {
-      int source_index = host_permuted_rows[i] % num_rows;
-      int32_t lora_rank = lora_params.fc1_lora_ranks[source_index];
-      host_permuted_fc1_weight_ptrs[i * 2] =
-          reinterpret_cast<ScaleBiasType const*>(
-              lora_params.fc1_lora_weight_ptrs[source_index * 2]) +
-          weight_index * hidden_size * lora_rank;
-      host_permuted_fc1_weight_ptrs[i * 2 + 1] =
-          reinterpret_cast<ScaleBiasType const*>(
-              lora_params.fc1_lora_weight_ptrs[source_index * 2 + 1]) +
-          weight_index * lora_rank * inter_size;
-      host_permuted_fc1_lora_ranks[i] = lora_rank;
-
-      lora_rank = lora_params.fc2_lora_ranks[source_index];
-      host_permuted_fc2_weight_ptrs[i * 2] =
-          reinterpret_cast<ScaleBiasType const*>(
-              lora_params.fc2_lora_weight_ptrs[source_index * 2]) +
-          weight_index * inter_size * lora_rank;
-      host_permuted_fc2_weight_ptrs[i * 2 + 1] =
-          reinterpret_cast<ScaleBiasType const*>(
-              lora_params.fc2_lora_weight_ptrs[source_index * 2 + 1]) +
-          weight_index * lora_rank * hidden_size;
-      host_permuted_fc2_lora_ranks[i] = lora_rank;
-
-      if (host_permuted_fc1_lora_ranks[i] || host_permuted_fc2_lora_ranks[i]) {
-        all_token_without_lora = false;
-      }
-
-      if (is_gated_activation) {
-        lora_rank = lora_params.gated_lora_ranks[source_index];
-        host_permuted_gated_weight_ptrs[i * 2] =
-            reinterpret_cast<ScaleBiasType const*>(
-                lora_params.gated_lora_weight_ptrs[source_index * 2]) +
-            weight_index * hidden_size * lora_rank;
-        host_permuted_gated_weight_ptrs[i * 2 + 1] =
-            reinterpret_cast<ScaleBiasType const*>(
-                lora_params.gated_lora_weight_ptrs[source_index * 2 + 1]) +
-            weight_index * lora_rank * inter_size;
-        host_permuted_gated_lora_ranks[i] = lora_rank;
-
-        if (host_permuted_gated_lora_ranks[i]) {
-          all_token_without_lora = false;
-        }
-      }
-    }
-  }
-  return all_token_without_lora;
+  return false;
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
@@ -3465,20 +6689,11 @@ auto CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
                                          bool is_gated_activation,
                                          ScaleBiasType const* fc1_expert_biases,
                                          LoraParams& lora_params, float const* input_fp8_dequant,
-                                         cudaStream_t stream) -> ScaleBiasType const* {
+                                         InputType const* original_input_activations,
+                                         int64_t num_rows, cudaStream_t stream)
+    -> ScaleBiasType const* {
   TLLM_CHECK_WITH_INFO(!act_fp4, "LoRA does not support FP4 activations");
-  std::vector<void const*>& host_permuted_fc1_weight_ptrs =
-      host_lora_workspace_.host_permuted_fc1_weight_ptrs;
-  std::vector<void const*>& host_permuted_gated_weight_ptrs =
-      host_lora_workspace_.host_permuted_gated_weight_ptrs;
-
-  std::vector<int32_t>& host_permuted_fc1_lora_ranks =
-      host_lora_workspace_.host_permuted_fc1_lora_ranks;
-  std::vector<int32_t>& host_permuted_gated_lora_ranks =
-      host_lora_workspace_.host_permuted_gated_lora_ranks;
-  std::vector<int64_t>& host_expert_first_token_offset =
-      host_lora_workspace_.host_expert_first_token_offset;
-
+  (void)start_expert;
   auto fc1_lora_impl = lora_params.fc1_lora_impl;
   int num_reqs = lora_params.num_reqs;
 
@@ -3505,22 +6720,103 @@ auto CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
   }
 
   void* lora_workspace = lora_params.workspace;
-  void* tmp_lora_fc_result = static_cast<void*>(lora_fc1_result);
-  int64_t num_valid_tokens = host_expert_first_token_offset[num_experts_per_node];
+  int64_t num_valid_tokens = expanded_num_rows;
   int64_t num_reqs_lora =
       std::min(num_valid_tokens, static_cast<int64_t>(num_reqs * num_experts_per_node));
+  bool const use_gated_direct_layout = is_gated_activation && fc1_expert_biases == nullptr;
 
-  ::tensorrt_llm::kernels::Lora_run(fc1_lora_impl.get(), num_valid_tokens, num_reqs_lora, input,
-                                    host_permuted_fc1_lora_ranks.data(),
-                                    host_permuted_fc1_weight_ptrs.data(), 0, &tmp_lora_fc_result,
-                                    lora_workspace, stream);
+  if (use_gated_direct_layout) {
+    TLLM_CHECK(lora_params.fc1_gated_lora_impl != nullptr);
 
-  if (is_gated_activation) {
-    void* tmp_lora_gated_result = static_cast<void*>(lora_gated_out);
-    ::tensorrt_llm::kernels::Lora_run(fc1_lora_impl.get(), num_valid_tokens, num_reqs_lora, input,
-                                      host_permuted_gated_lora_ranks.data(),
-                                      host_permuted_gated_weight_ptrs.data(), 0,
-                                      &tmp_lora_gated_result, lora_workspace, stream);
+    bool used_grouped_fc1_gated_output = false;
+    if constexpr (std::is_same_v<ScaleBiasType, __nv_bfloat16>) {
+      used_grouped_fc1_gated_output =
+          lora_params.max_low_rank == 16 && expanded_num_rows >= 1024 && (inter_size % 2 == 0);
+      if (used_grouped_fc1_gated_output) {
+        bool const used_tc_grouped_low_rank = lora_params.rows_grouped_by_adapter &&
+                                              hidden_size % 16 == 0 &&
+                                              lora_params.adapter_expert_row_counts != nullptr &&
+                                              lora_params.adapter_expert_row_starts != nullptr;
+        bool const used_tc_grouped_output = lora_params.rows_grouped_by_adapter &&
+                                            (inter_size % 16 == 0) &&
+                                            lora_params.adapter_expert_row_counts != nullptr &&
+                                            lora_params.adapter_expert_row_starts != nullptr;
+        if (used_tc_grouped_low_rank) {
+          auto* low_rank_workspace = reinterpret_cast<__nv_bfloat16*>(lora_workspace);
+          auto const* low_rank_input = reinterpret_cast<__nv_bfloat16 const*>(input);
+          loraLowRank16Bf16TensorCoreGroupedDual(
+              low_rank_input, hidden_size, expanded_num_rows, num_valid_tokens, hidden_size * 16,
+              lora_params.num_lora_adapters, num_experts_per_node, lora_params.gated_lora_ranks,
+              lora_params.gated_lora_weight_ptrs, lora_params.fc1_lora_ranks,
+              lora_params.fc1_lora_weight_ptrs, lora_params.adapter_expert_row_counts,
+              lora_params.adapter_expert_row_starts, low_rank_workspace,
+              low_rank_workspace + expanded_num_rows * 16, stream);
+        } else {
+          TLLM_CHECK(lora_params.permuted_gated_lora_ranks != nullptr);
+          TLLM_CHECK(lora_params.permuted_gated_lora_weight_ptrs != nullptr);
+          ::tensorrt_llm::kernels::Lora_run_device_low_rank(
+              lora_params.fc1_gated_lora_impl.get(), num_valid_tokens, num_reqs_lora, input,
+              lora_params.permuted_gated_lora_ranks, lora_params.permuted_gated_lora_weight_ptrs, 0,
+              lora_workspace, stream);
+        }
+        auto const* low_rank_workspace = reinterpret_cast<__nv_bfloat16 const*>(lora_workspace);
+        if (used_tc_grouped_output) {
+          loraOutput16Bf16TensorCoreGroupedDual(
+              static_cast<__nv_bfloat16*>(lora_add_bias_),
+              static_cast<__nv_bfloat16*>(lora_add_bias_ + inter_size), low_rank_workspace,
+              low_rank_workspace + expanded_num_rows * 16, inter_size, inter_size * 2,
+              lora_params.num_lora_adapters, num_experts_per_node, lora_params.gated_lora_ranks,
+              lora_params.gated_lora_weight_ptrs, lora_params.fc1_lora_ranks,
+              lora_params.fc1_lora_weight_ptrs, lora_params.adapter_expert_row_counts,
+              lora_params.adapter_expert_row_starts, lora_params.no_adapter_expert_row_counts,
+              lora_params.no_adapter_expert_row_starts, stream,
+              lora_params.permuted_fc1_gated_lora_bias_ranks == nullptr);
+        } else {
+          TLLM_CHECK(lora_params.permuted_gated_lora_weight_ptrs != nullptr);
+          TLLM_CHECK(lora_params.permuted_fc1_lora_weight_ptrs != nullptr);
+          fc1GatedLoraRank16Bf16GroupedOutput(
+              static_cast<__nv_bfloat16*>(lora_add_bias_), low_rank_workspace,
+              expert_first_token_offset_, expanded_num_rows, inter_size, num_experts_per_node,
+              lora_params.num_lora_adapters, lora_params.gated_lora_ranks,
+              lora_params.gated_lora_weight_ptrs, lora_params.fc1_lora_ranks,
+              lora_params.fc1_lora_weight_ptrs, lora_params.permuted_gated_lora_weight_ptrs,
+              lora_params.permuted_fc1_lora_weight_ptrs, lora_params.permuted_lora_indices,
+              lora_params.adapter_expert_row_counts, lora_params.adapter_expert_row_indices,
+              lora_params.adapter_expert_row_capacity, lora_params.no_adapter_expert_row_counts,
+              lora_params.no_adapter_expert_row_indices, lora_params.no_adapter_expert_row_capacity,
+              lora_params.adapter_expert_row_starts, lora_params.no_adapter_expert_row_starts,
+              lora_params.rows_grouped_by_adapter, lora_params.fc1_gated_lora_has_missing_rows,
+              stream);
+        }
+      }
+    }
+
+    if (!used_grouped_fc1_gated_output) {
+      TLLM_CHECK(lora_params.permuted_gated_lora_ranks != nullptr);
+      TLLM_CHECK(lora_params.permuted_gated_lora_weight_ptrs != nullptr);
+      void* tmp_lora_outputs[] = {static_cast<void*>(lora_add_bias_),
+                                  static_cast<void*>(lora_add_bias_ + inter_size)};
+      int64_t const lora_output_strides[] = {2 * inter_size, 2 * inter_size};
+      ::tensorrt_llm::kernels::Lora_run_device_strided_outputs(
+          lora_params.fc1_gated_lora_impl.get(), num_valid_tokens, num_reqs_lora, input,
+          lora_params.permuted_gated_lora_ranks, lora_params.permuted_gated_lora_weight_ptrs, 0,
+          tmp_lora_outputs, lora_output_strides, lora_workspace, stream);
+    }
+  } else {
+    void* tmp_lora_fc_result = static_cast<void*>(lora_fc1_result);
+    ::tensorrt_llm::kernels::Lora_run_device(fc1_lora_impl.get(), num_valid_tokens, num_reqs_lora,
+                                             input, lora_params.permuted_fc1_lora_ranks,
+                                             lora_params.permuted_fc1_lora_weight_ptrs, 0,
+                                             &tmp_lora_fc_result, lora_workspace, stream);
+    if (is_gated_activation) {
+      TLLM_CHECK(lora_params.permuted_gated_lora_ranks != nullptr);
+      TLLM_CHECK(lora_params.permuted_gated_lora_weight_ptrs != nullptr);
+      void* tmp_lora_gated_out = static_cast<void*>(lora_gated_out);
+      ::tensorrt_llm::kernels::Lora_run_device(fc1_lora_impl.get(), num_valid_tokens, num_reqs_lora,
+                                               input, lora_params.permuted_gated_lora_ranks,
+                                               lora_params.permuted_gated_lora_weight_ptrs, 0,
+                                               &tmp_lora_gated_out, lora_workspace, stream);
+    }
   }
 
   // add bias and reorder
@@ -3530,8 +6826,10 @@ auto CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
                 is_gated_activation, stream);
     return lora_add_bias_;
   } else if (is_gated_activation) {
-    loraReorder(lora_add_bias_, lora_fc1_result_, num_valid_tokens_ptr, inter_size,
-                expanded_num_rows, stream);
+    if (!use_gated_direct_layout) {
+      loraReorder(lora_add_bias_, lora_fc1_result_, num_valid_tokens_ptr, inter_size,
+                  expanded_num_rows, stream);
+    }
     return lora_add_bias_;
   } else {
     return lora_fc1_result_;
@@ -3546,12 +6844,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
                                          int64_t const* num_valid_tokens_ptr, int64_t num_tokens,
                                          LoraParams& lora_params, float const* fc2_fp8_quant,
                                          cudaStream_t stream) {
-  std::vector<void const*>& host_permuted_fc2_weight_ptrs =
-      host_lora_workspace_.host_permuted_fc2_weight_ptrs;
-  std::vector<int32_t>& host_permuted_fc2_lora_ranks =
-      host_lora_workspace_.host_permuted_fc2_lora_ranks;
-  std::vector<int64_t>& host_expert_first_token_offset =
-      host_lora_workspace_.host_expert_first_token_offset;
+  (void)start_expert;
   auto fc2_lora_impl = lora_params.fc2_lora_impl;
   int num_reqs = lora_params.num_reqs;
 
@@ -3569,16 +6862,153 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
   }
 
   void* lora_workspace = lora_params.workspace;
-  int64_t num_valid_tokens = host_expert_first_token_offset[num_experts_per_node];
+  int64_t num_valid_tokens = num_tokens;
   void* tmp_lora_fc_result = static_cast<void*>(lora_fc2_result_);
   int64_t num_reqs_lora =
       std::min(num_valid_tokens, static_cast<int64_t>(num_reqs * num_experts_per_node));
 
-  ::tensorrt_llm::kernels::Lora_run(fc2_lora_impl.get(), num_valid_tokens, num_reqs_lora, input,
-                                    host_permuted_fc2_lora_ranks.data(),
-                                    host_permuted_fc2_weight_ptrs.data(), 0, &tmp_lora_fc_result,
-                                    lora_workspace, stream);
+  ::tensorrt_llm::kernels::Lora_run_device(fc2_lora_impl.get(), num_valid_tokens, num_reqs_lora,
+                                           input, lora_params.permuted_fc2_lora_ranks,
+                                           lora_params.permuted_fc2_lora_weight_ptrs, 0,
+                                           &tmp_lora_fc_result, lora_workspace, stream);
   sync_check_cuda_error(stream);
+}
+
+template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
+          bool IsMXFPX, class Enable>
+void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
+                        Enable>::loraFC2LowRank(int64_t inter_size, int64_t hidden_size,
+                                                int num_experts_per_node, int start_expert,
+                                                int64_t const* num_valid_tokens_ptr,
+                                                int64_t num_tokens, LoraParams& lora_params,
+                                                float const* fc2_fp8_quant, cudaStream_t stream) {
+  (void)hidden_size;
+  (void)start_expert;
+  auto fc2_lora_impl = lora_params.fc2_lora_impl;
+  int num_reqs = lora_params.num_reqs;
+
+  ScaleBiasType* input{};
+  if constexpr (use_fp8) {
+    TLLM_CHECK(lora_input_);
+    bool const scale_is_dequant = false;
+    dequantFP8(lora_input_, fc1_result_, num_valid_tokens_ptr, inter_size, num_tokens,
+               fc2_fp8_quant, scale_is_dequant, stream);
+    sync_check_cuda_error(stream);
+    input = lora_input_;
+  } else if constexpr (!act_fp4) {
+    TLLM_CHECK(!lora_input_);
+    input = reinterpret_cast<ScaleBiasType*>(fc1_result_);
+  }
+
+  int64_t num_valid_tokens = num_tokens;
+  int64_t num_reqs_lora =
+      std::min(num_valid_tokens, static_cast<int64_t>(num_reqs * num_experts_per_node));
+  if constexpr (std::is_same_v<ScaleBiasType, __nv_bfloat16>) {
+    bool const used_tc_grouped_low_rank =
+        lora_params.max_low_rank == 16 && lora_params.rows_grouped_by_adapter &&
+        inter_size % 16 == 0 && lora_params.adapter_expert_row_counts != nullptr &&
+        lora_params.adapter_expert_row_starts != nullptr;
+    if (used_tc_grouped_low_rank) {
+      loraLowRank16Bf16TensorCoreGrouped(
+          reinterpret_cast<__nv_bfloat16 const*>(input), inter_size, num_tokens, num_valid_tokens,
+          inter_size * 16, lora_params.num_lora_adapters, num_experts_per_node, 1,
+          lora_params.fc2_lora_ranks, lora_params.fc2_lora_weight_ptrs,
+          lora_params.adapter_expert_row_counts, lora_params.adapter_expert_row_starts,
+          reinterpret_cast<__nv_bfloat16*>(lora_params.workspace), stream);
+    } else {
+      ::tensorrt_llm::kernels::Lora_run_device_low_rank(
+          fc2_lora_impl.get(), num_valid_tokens, num_reqs_lora, input,
+          lora_params.permuted_fc2_lora_ranks, lora_params.permuted_fc2_lora_weight_ptrs, 0,
+          lora_params.workspace, stream);
+    }
+  } else {
+    ::tensorrt_llm::kernels::Lora_run_device_low_rank(
+        fc2_lora_impl.get(), num_valid_tokens, num_reqs_lora, input,
+        lora_params.permuted_fc2_lora_ranks, lora_params.permuted_fc2_lora_weight_ptrs, 0,
+        lora_params.workspace, stream);
+  }
+}
+
+template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
+          bool IsMXFPX, class Enable>
+void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
+                        Enable>::loraFC2OutputAdd(int64_t hidden_size, int num_experts_per_node,
+                                                  int64_t num_tokens, LoraParams& lora_params,
+                                                  void* output, cudaStream_t stream) {
+  if constexpr (std::is_same_v<ScaleBiasType, __nv_bfloat16>) {
+    TLLM_CHECK(lora_params.max_low_rank == 16);
+    TLLM_CHECK((hidden_size % 2) == 0);
+    auto const* low_rank_workspace = reinterpret_cast<__nv_bfloat16 const*>(lora_params.workspace);
+    bool const used_tc_grouped_output = lora_params.rows_grouped_by_adapter &&
+                                        (hidden_size % 16 == 0) &&
+                                        lora_params.adapter_expert_row_counts != nullptr &&
+                                        lora_params.adapter_expert_row_starts != nullptr;
+    if (used_tc_grouped_output) {
+      loraOutput16Bf16TensorCoreGrouped<true>(
+          static_cast<__nv_bfloat16*>(output), low_rank_workspace, hidden_size, hidden_size,
+          num_tokens, lora_params.num_lora_adapters, num_experts_per_node,
+          lora_params.fc2_lora_ranks, lora_params.fc2_lora_weight_ptrs,
+          lora_params.adapter_expert_row_counts, lora_params.adapter_expert_row_starts, stream);
+    } else {
+      fc2LoraRank16Bf16GroupedOutputAdd(
+          static_cast<__nv_bfloat16*>(output), low_rank_workspace, expert_first_token_offset_,
+          hidden_size, num_experts_per_node, lora_params.num_lora_adapters, lora_params.fc2_lora_ranks,
+          lora_params.fc2_lora_weight_ptrs, lora_params.permuted_lora_indices,
+          lora_params.adapter_expert_row_counts, lora_params.adapter_expert_row_indices,
+          lora_params.adapter_expert_row_capacity, lora_params.adapter_expert_row_starts,
+          lora_params.rows_grouped_by_adapter, stream);
+    }
+  } else {
+    (void)hidden_size;
+    (void)num_experts_per_node;
+    (void)num_tokens;
+    (void)lora_params;
+    (void)output;
+    (void)stream;
+    TLLM_THROW("Split FC2 LoRA output-add is only implemented for BF16.");
+  }
+}
+
+template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
+          bool IsMXFPX, class Enable>
+void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
+                        Enable>::loraFC2Output(int64_t hidden_size, int num_experts_per_node,
+                                               int64_t num_tokens, LoraParams& lora_params,
+                                               void* output, cudaStream_t stream,
+                                               int output_split_count, int output_split_index) {
+  if constexpr (std::is_same_v<ScaleBiasType, __nv_bfloat16>) {
+    TLLM_CHECK(lora_params.max_low_rank == 16);
+    TLLM_CHECK((hidden_size % 2) == 0);
+    auto const* low_rank_workspace = reinterpret_cast<__nv_bfloat16 const*>(lora_params.workspace);
+    bool const used_tc_grouped_output = lora_params.rows_grouped_by_adapter &&
+                                        (hidden_size % 16 == 0) &&
+                                        lora_params.adapter_expert_row_counts != nullptr &&
+                                        lora_params.adapter_expert_row_starts != nullptr;
+    if (used_tc_grouped_output) {
+      loraOutput16Bf16TensorCoreGrouped<false>(
+          static_cast<__nv_bfloat16*>(output), low_rank_workspace, hidden_size, hidden_size,
+          num_tokens, lora_params.num_lora_adapters, num_experts_per_node,
+          lora_params.fc2_lora_ranks, lora_params.fc2_lora_weight_ptrs,
+          lora_params.adapter_expert_row_counts, lora_params.adapter_expert_row_starts, stream,
+          output_split_count, output_split_index);
+    } else {
+      fc2LoraRank16Bf16GroupedOutput(
+          static_cast<__nv_bfloat16*>(output), low_rank_workspace, expert_first_token_offset_,
+          hidden_size, num_experts_per_node, lora_params.num_lora_adapters, lora_params.fc2_lora_ranks,
+          lora_params.fc2_lora_weight_ptrs, lora_params.permuted_lora_indices,
+          lora_params.adapter_expert_row_counts, lora_params.adapter_expert_row_indices,
+          lora_params.adapter_expert_row_capacity, lora_params.adapter_expert_row_starts,
+          lora_params.rows_grouped_by_adapter, stream);
+    }
+  } else {
+    (void)hidden_size;
+    (void)num_experts_per_node;
+    (void)num_tokens;
+    (void)lora_params;
+    (void)output;
+    (void)stream;
+    TLLM_THROW("Split FC2 LoRA output materialization is only implemented for BF16.");
+  }
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
@@ -3765,6 +7195,23 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
 
   auto expanded_num_rows = num_rows * experts_per_token;
 
+  bool split_fc2_lora_output_add = false;
+  if constexpr (std::is_same_v<UnfusedGemmOutputType, __nv_bfloat16> &&
+                std::is_same_v<ScaleBiasType, __nv_bfloat16>) {
+    split_fc2_lora_output_add = use_lora && expanded_num_rows >= 1024 &&
+                                lora_params.max_low_rank == 16 && (hidden_size % 2 == 0);
+  }
+  bool fuse_fc2_lora_finalize = false;
+  if constexpr (std::is_same_v<OutputType, __nv_bfloat16> &&
+                std::is_same_v<UnfusedGemmOutputType, __nv_bfloat16> &&
+                std::is_same_v<ScaleBiasType, __nv_bfloat16>) {
+    fuse_fc2_lora_finalize =
+        split_fc2_lora_output_add && num_rows >= 32768 && hidden_size == unpadded_hidden_size &&
+        parallelism_config.tp_size == 1 && parallelism_config.tp_rank == 0 &&
+        parallelism_config.ep_size == 1 && parallelism_config.ep_rank == 0 && !enable_alltoall &&
+        !use_deepseek_fp8_block_scale && !use_awq && !use_w4_groupwise;
+  }
+  bool const overlap_fc2_lora_with_gemm2 = split_fc2_lora_output_add;
   if (min_latency_mode) {
     TLLM_CHECK(use_lora == false);
     TLLM_CHECK(use_awq == false);
@@ -3782,7 +7229,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
         num_rows, expanded_num_rows, fc1_activation_type, hidden_size, unpadded_hidden_size,
         inter_size, num_experts_per_node, input_activations_void, input_sf, final_output,
         fc1_expert_weights, fc2_expert_weights, quant_params, fc1_expert_biases, fc2_expert_biases,
-        min_latency_mode, min_latency_params, use_lora, start_expert, parallelism_config,
+        min_latency_mode, min_latency_params, use_lora, start_expert, parallelism_config, false,
         enable_pdl, stream);
 
     // todo: input_activations_void should be nvfp4, waiting for yuxian's mr ready
@@ -3795,7 +7242,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
                 quant_params, num_rows, expanded_num_rows, hidden_size, inter_size,
                 num_experts_per_node, fc1_activation_type, alpha_scale_ptr_array_fc1_, !use_lora,
                 stream, *gemm1_config_, true, min_latency_params.num_active_experts_per_node,
-                min_latency_params.active_expert_global_ids, enable_pdl);
+                min_latency_params.active_expert_global_ids, enable_pdl, nullptr);
     sync_check_cuda_error(stream);
 
     auto gemm2_input =
@@ -3808,10 +7255,10 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
                 unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row_,
                 token_selected_experts, num_valid_tokens_ptr, num_rows, expanded_num_rows,
                 hidden_size, unpadded_hidden_size, inter_size, num_experts_per_node,
-                experts_per_token, alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_, stream,
-                parallelism_config, enable_alltoall, *gemm2_config_, true,
+                experts_per_token, alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_, nullptr,
+                stream, parallelism_config, enable_alltoall, *gemm2_config_, true,
                 min_latency_params.num_active_experts_per_node,
-                min_latency_params.active_expert_global_ids, enable_pdl);
+                min_latency_params.active_expert_global_ids, false, enable_pdl);
     sync_check_cuda_error(stream);
   } else {
     bool fused_prologue_result = false;
@@ -3833,23 +7280,37 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
           num_experts_per_node, experts_per_token, start_expert, enable_pdl, stream);
     }
 
+    if (use_lora && lora_params.token_lora_indices != nullptr && num_rows >= 32768) {
+      int64_t const num_tokens_per_block = computeNumTokensPerBlock(num_rows, num_experts_per_node);
+      int64_t const num_blocks_per_seq =
+          tensorrt_llm::common::ceilDiv(num_rows, num_tokens_per_block);
+      int64_t const routing_bucket_capacity = num_experts_per_node * num_blocks_per_seq;
+      lora_params.rows_grouped_by_adapter = regroupExpertRowsByLoraAdapter(
+          permuted_token_selected_experts_, permuted_row_to_unpermuted_row_,
+          unpermuted_row_to_permuted_row, expert_first_token_offset_,
+          lora_params.token_lora_indices, lora_params.token_lora_indices_is_int64,
+          blocked_expert_counts_, blocked_expert_counts_cumsum_, blocked_row_to_unpermuted_row_,
+          num_rows, expanded_num_rows, num_experts_per_node, lora_params.num_lora_adapters,
+          routing_bucket_capacity, false, stream);
+      if (lora_params.rows_grouped_by_adapter) {
+        permuted_row_to_unpermuted_row_ = blocked_row_to_unpermuted_row_;
+      }
+    }
+
     sync_check_cuda_error(stream);
 
+    std::function<void()> deferred_fc1_lora_work;
     bool is_gated_activation = isGatedActivation(fc1_activation_type);
-
-    if (use_lora) {
-      std::vector<int>& host_permuted_rows = host_lora_workspace_.host_permuted_rows;
-      std::vector<int64_t>& host_expert_first_token_offset =
-          host_lora_workspace_.host_expert_first_token_offset;
-      host_permuted_rows.resize(expanded_num_rows);
-      TLLM_CUDA_CHECK(tensorrt_llm::common::cudaMemcpyAsyncSanitized(
-          host_permuted_rows.data(), permuted_row_to_unpermuted_row_,
-          expanded_num_rows * sizeof(int), cudaMemcpyDeviceToHost, stream));
-      host_expert_first_token_offset.resize(num_experts_per_node + 1);
-      TLLM_CUDA_CHECK(tensorrt_llm::common::cudaMemcpyAsyncSanitized(
-          host_expert_first_token_offset.data(), expert_first_token_offset_,
-          (num_experts_per_node + 1) * sizeof(int64_t), cudaMemcpyDeviceToHost, stream));
-      TLLM_CUDA_CHECK(cudaEventRecord(*(lora_params.memcpy_event_ptr), stream));
+    cudaEvent_t fc1_lora_ready_event = nullptr;
+    bool overlap_fc1_lora_with_gemm1 = false;
+    if constexpr (std::is_same_v<T, __nv_bfloat16> && std::is_same_v<InputType, __nv_bfloat16> &&
+                  std::is_same_v<ScaleBiasType, __nv_bfloat16>) {
+      overlap_fc1_lora_with_gemm1 =
+          use_lora && is_gated_activation && fc1_expert_biases == nullptr &&
+          lora_params.max_low_rank == 16 && expanded_num_rows >= 1024 &&
+          lora_params.rows_grouped_by_adapter && !use_deepseek_fp8_block_scale && !use_awq &&
+          !use_w4_groupwise && gemm1_config_->swap_ab &&
+          moe_gemm_runner_.isTmaWarpSpecialized(*gemm1_config_);
     }
 
     // Only NVFP4xNVFP4 supports FC1 per-expert act scale
@@ -3858,37 +7319,61 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
         use_w4afp8 ? reinterpret_cast<T*>(smoothed_act_) : reinterpret_cast<T*>(permuted_data_);
     expandInputRowsKernelLauncher(
         input_activations, gemm1_input_expand, token_topk_unpermuted_scales,
-        permuted_token_final_scales_, permuted_row_to_unpermuted_row_, num_rows, hidden_size,
-        experts_per_token, num_experts_per_node, quant_params, use_per_expert_act_scale,
-        expert_first_token_offset_, fc1_fp4_act_scale_, input_sf, swizzled_input_sf,
+        permuted_token_final_scales_, permuted_row_to_unpermuted_row_,
+        unpermuted_row_to_permuted_row, token_selected_experts, num_rows, hidden_size,
+        experts_per_token, num_experts_per_node, start_expert, quant_params,
+        use_per_expert_act_scale, expert_first_token_offset_, fc1_fp4_act_scale_, input_sf,
+        swizzled_input_sf,
         (use_w4afp8 && !use_fp8_input) ? quant_params.groupwise.fc1.act_scales : nullptr,
         enable_pdl, stream);
     auto const* gemm1_input = gemm1_input_expand;
 
     sync_check_cuda_error(stream);
 
+    if (use_lora) {
+      bool const use_grouped_lora_metadata_fast_path =
+          lora_params.rows_grouped_by_adapter && is_gated_activation &&
+          fc1_expert_biases == nullptr && split_fc2_lora_output_add;
+      bool all_token_without_lora =
+          setupLoraWorkspace(expanded_num_rows, num_rows, inter_size, hidden_size, start_expert,
+                             is_gated_activation, num_experts_per_node, needs_num_valid,
+                             lora_params, use_grouped_lora_metadata_fast_path, stream);
+
+      if (!all_token_without_lora) {
+        if (overlap_fc1_lora_with_gemm1) {
+          check_cuda_error(cudaEventRecord(lora_start_event_, stream));
+          auto const* fc1_lora_base_biases = fc1_expert_biases;
+          fc1_expert_biases = lora_add_bias_;
+          deferred_fc1_lora_work = [&, fc1_lora_base_biases]() {
+            check_cuda_error(cudaStreamWaitEvent(lora_stream_, lora_start_event_, 0));
+            (void)loraFC1(expanded_num_rows, inter_size, hidden_size, num_experts_per_node,
+                          start_expert, num_valid_tokens_ptr, is_gated_activation,
+                          fc1_lora_base_biases, lora_params, input_fp8_dequant, input_activations,
+                          num_rows, lora_stream_);
+            check_cuda_error(cudaEventRecord(lora_ready_event_, lora_stream_));
+          };
+          fc1_lora_ready_event = lora_ready_event_;
+        } else {
+          fc1_expert_biases =
+              loraFC1(expanded_num_rows, inter_size, hidden_size, num_experts_per_node,
+                      start_expert, num_valid_tokens_ptr, is_gated_activation, fc1_expert_biases,
+                      lora_params, input_fp8_dequant, input_activations, num_rows, stream);
+          sync_check_cuda_error(stream);
+        }
+      } else {
+        use_lora = false;
+        split_fc2_lora_output_add = false;
+        fuse_fc2_lora_finalize = false;
+        fc1_lora_ready_event = nullptr;
+      }
+    }
+
     auto [gemm1_tma_ws_input, gemm2_tma_ws_input] = setupTmaWarpSpecializedInputs(
         num_rows, expanded_num_rows, fc1_activation_type, hidden_size, unpadded_hidden_size,
         inter_size, num_experts_per_node, input_activations_void, input_sf, final_output,
         fc1_expert_weights, fc2_expert_weights, quant_params, fc1_expert_biases, fc2_expert_biases,
         min_latency_mode, min_latency_params, use_lora, start_expert, parallelism_config,
-        enable_pdl, stream);
-
-    if (use_lora) {
-      bool all_token_without_lora = setupLoraWorkspace(
-          expanded_num_rows, num_rows, inter_size, hidden_size, start_expert, is_gated_activation,
-          num_experts_per_node, needs_num_valid, lora_params, stream);
-
-      if (!all_token_without_lora) {
-        fc1_expert_biases =
-            loraFC1(expanded_num_rows, inter_size, hidden_size, num_experts_per_node, start_expert,
-                    num_valid_tokens_ptr, is_gated_activation, fc1_expert_biases, lora_params,
-                    input_fp8_dequant, stream);
-        sync_check_cuda_error(stream);
-      } else {
-        use_lora = false;
-      }
-    }
+        fuse_fc2_lora_finalize, enable_pdl, stream);
 
     if constexpr (!use_w4afp8) {
       gemm1_input =
@@ -3903,29 +7388,156 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
                 fc1_fp4_act_scale_, fc2_fp4_act_scale_, quant_params, num_rows, expanded_num_rows,
                 hidden_size, inter_size, num_experts_per_node, fc1_activation_type,
                 alpha_scale_ptr_array_fc1_, !use_lora, stream, *gemm1_config_, false, nullptr,
-                nullptr, enable_pdl);
+                nullptr, enable_pdl, fc1_lora_ready_event,
+                lora_params.permuted_fc1_gated_lora_bias_ranks,
+                deferred_fc1_lora_work ? &deferred_fc1_lora_work : nullptr);
     sync_check_cuda_error(stream);
-
-    if (use_lora) {
-      loraFC2(inter_size, hidden_size, num_experts_per_node, start_expert, num_valid_tokens_ptr,
-              expanded_num_rows, lora_params, fc2_fp8_quant, stream);
-      sync_check_cuda_error(stream);
-    }
 
     auto gemm2_input =
         applyPrequantScale(smoothed_act_, fc1_result_, quant_params.groupwise.fc2.act_scales,
                            num_valid_tokens_ptr, expanded_num_rows, inter_size, use_awq, stream);
     sync_check_cuda_error(stream);
-    Self::gemm2(
-        moe_gemm_runner_, blockscale_gemm_runner, gemm2_input, fc2_result_, final_output,
-        expert_first_token_offset_, gemm2_tma_ws_input, fc2_expert_weights, fc2_expert_biases,
-        fc2_int_scales, fc2_fp8_dequant, fc2_fp4_act_scale_, quant_params,
-        token_topk_unpermuted_scales, permuted_token_final_scales_, unpermuted_row_to_permuted_row,
-        permuted_row_to_unpermuted_row_, token_selected_experts, num_valid_tokens_ptr, num_rows,
-        expanded_num_rows, hidden_size, unpadded_hidden_size, inter_size, num_experts_per_node,
-        experts_per_token, alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_, stream,
-        parallelism_config, enable_alltoall, *gemm2_config_, false, nullptr, nullptr, enable_pdl);
+
+    auto launch_split_fc2_lora_low_rank = [&](cudaStream_t fc2_lora_stream) {
+      loraFC2LowRank(inter_size, hidden_size, num_experts_per_node, start_expert,
+                     num_valid_tokens_ptr, expanded_num_rows, lora_params, fc2_fp8_quant,
+                     fc2_lora_stream);
+    };
+    auto launch_split_fc2_lora_output = [&](cudaStream_t fc2_lora_stream) {
+      if (fuse_fc2_lora_finalize) {
+        loraFC2Output(hidden_size, num_experts_per_node, expanded_num_rows, lora_params,
+                      lora_fc2_result_, fc2_lora_stream);
+      }
+    };
+    auto launch_split_fc2_lora = [&](cudaStream_t fc2_lora_stream) {
+      launch_split_fc2_lora_low_rank(fc2_lora_stream);
+      launch_split_fc2_lora_output(fc2_lora_stream);
+    };
+
+    bool queued_overlapped_fc2_lora = false;
+    if (use_lora) {
+      if (split_fc2_lora_output_add) {
+        if (overlap_fc2_lora_with_gemm2) {
+          check_cuda_error(cudaEventRecord(lora_start_event_, stream));
+          check_cuda_error(cudaStreamWaitEvent(lora_stream_, lora_start_event_, 0));
+          launch_split_fc2_lora(lora_stream_);
+          check_cuda_error(cudaEventRecord(lora_fc2_ready_event_, lora_stream_));
+          queued_overlapped_fc2_lora = true;
+        } else {
+          launch_split_fc2_lora(stream);
+        }
+      } else {
+        loraFC2(inter_size, hidden_size, num_experts_per_node, start_expert, num_valid_tokens_ptr,
+                expanded_num_rows, lora_params, fc2_fp8_quant, stream);
+      }
+      sync_check_cuda_error(stream);
+    }
+
+    Self::gemm2(moe_gemm_runner_, blockscale_gemm_runner, gemm2_input, fc2_result_, final_output,
+                expert_first_token_offset_, gemm2_tma_ws_input, fc2_expert_weights,
+                fc2_expert_biases, fc2_int_scales, fc2_fp8_dequant, fc2_fp4_act_scale_,
+                quant_params, token_topk_unpermuted_scales, permuted_token_final_scales_,
+                unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row_,
+                token_selected_experts, num_valid_tokens_ptr, num_rows, expanded_num_rows,
+                hidden_size, unpadded_hidden_size, inter_size, num_experts_per_node,
+                experts_per_token, alpha_scale_ptr_array_fc2_,
+                split_fc2_lora_output_add ? false : use_lora, lora_fc2_result_,
+                lora_params.permuted_fc2_lora_ranks, stream, parallelism_config, enable_alltoall,
+                *gemm2_config_, false, nullptr, nullptr, split_fc2_lora_output_add, enable_pdl);
     sync_check_cuda_error(stream);
+
+    if (split_fc2_lora_output_add) {
+      bool waited_for_fc2_lora = false;
+      if (overlap_fc2_lora_with_gemm2) {
+        if (!queued_overlapped_fc2_lora) {
+          check_cuda_error(cudaStreamWaitEvent(lora_stream_, lora_start_event_, 0));
+          launch_split_fc2_lora(lora_stream_);
+          check_cuda_error(cudaEventRecord(lora_fc2_ready_event_, lora_stream_));
+        }
+      }
+      if (fuse_fc2_lora_finalize) {
+        bool const used_base_finalize_fusion =
+            gemm2_tma_ws_input.fusion ==
+            TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE;
+        if (used_base_finalize_fusion) {
+          if (overlap_fc2_lora_with_gemm2 && !waited_for_fc2_lora) {
+            check_cuda_error(cudaStreamWaitEvent(stream, lora_fc2_ready_event_, 0));
+            waited_for_fc2_lora = true;
+          }
+          addFinalizedLoraToOutputKernelLauncher<OutputType, ScaleBiasType>(
+              static_cast<ScaleBiasType const*>(lora_fc2_result_),
+              lora_params.permuted_fc2_lora_ranks, final_output, token_topk_unpermuted_scales,
+              unpermuted_row_to_permuted_row, token_selected_experts, num_rows, hidden_size,
+              unpadded_hidden_size, experts_per_token, num_experts_per_node, parallelism_config,
+              enable_pdl, stream);
+        } else {
+          bool used_token_lora_finalize = false;
+          if constexpr (std::is_same_v<OutputType, __nv_bfloat16> &&
+                        std::is_same_v<UnfusedGemmOutputType, __nv_bfloat16> &&
+                        std::is_same_v<ScaleBiasType, __nv_bfloat16>) {
+            used_token_lora_finalize = fc2_expert_biases == nullptr &&
+                                       lora_params.token_lora_indices != nullptr &&
+                                       lora_params.fc2_lora_ranks != nullptr &&
+                                       lora_params.fc2_lora_weight_ptrs != nullptr &&
+                                       lora_params.num_lora_adapters > 0 && experts_per_token <= 16;
+            if (used_token_lora_finalize) {
+              if (overlap_fc2_lora_with_gemm2 && !waited_for_fc2_lora) {
+                check_cuda_error(cudaStreamWaitEvent(stream, lora_fc2_ready_event_, 0));
+                waited_for_fc2_lora = true;
+              }
+              if (lora_params.token_lora_indices_is_int64) {
+                finalizeMoeRoutingWithTokenLoraKernelLauncher<OutputType, UnfusedGemmOutputType,
+                                                              ScaleBiasType, int64_t>(
+                    static_cast<UnfusedGemmOutputType const*>(fc2_result_),
+                    static_cast<ScaleBiasType const*>(lora_fc2_result_), final_output,
+                    token_topk_unpermuted_scales, unpermuted_row_to_permuted_row,
+                    token_selected_experts,
+                    static_cast<int64_t const*>(lora_params.token_lora_indices),
+                    lora_params.fc2_lora_ranks, lora_params.fc2_lora_weight_ptrs, num_rows,
+                    hidden_size, unpadded_hidden_size, experts_per_token, num_experts_per_node,
+                    parallelism_config, lora_params.num_lora_adapters, enable_pdl, stream);
+              } else {
+                finalizeMoeRoutingWithTokenLoraKernelLauncher<OutputType, UnfusedGemmOutputType,
+                                                              ScaleBiasType, int32_t>(
+                    static_cast<UnfusedGemmOutputType const*>(fc2_result_),
+                    static_cast<ScaleBiasType const*>(lora_fc2_result_), final_output,
+                    token_topk_unpermuted_scales, unpermuted_row_to_permuted_row,
+                    token_selected_experts,
+                    static_cast<int32_t const*>(lora_params.token_lora_indices),
+                    lora_params.fc2_lora_ranks, lora_params.fc2_lora_weight_ptrs, num_rows,
+                    hidden_size, unpadded_hidden_size, experts_per_token, num_experts_per_node,
+                    parallelism_config, lora_params.num_lora_adapters, enable_pdl, stream);
+              }
+            }
+          }
+          if (!used_token_lora_finalize) {
+            if (overlap_fc2_lora_with_gemm2 && !waited_for_fc2_lora) {
+              check_cuda_error(cudaStreamWaitEvent(stream, lora_fc2_ready_event_, 0));
+              waited_for_fc2_lora = true;
+            }
+            finalizeMoeRoutingWithLoraKernelLauncher<OutputType, UnfusedGemmOutputType,
+                                                     ScaleBiasType>(
+                static_cast<UnfusedGemmOutputType const*>(fc2_result_),
+                static_cast<ScaleBiasType const*>(lora_fc2_result_),
+                lora_params.permuted_fc2_lora_ranks, final_output, fc2_expert_biases,
+                token_topk_unpermuted_scales, unpermuted_row_to_permuted_row,
+                token_selected_experts, num_rows, hidden_size, unpadded_hidden_size,
+                experts_per_token, num_experts_per_node, parallelism_config, enable_pdl, stream);
+          }
+        }
+      } else {
+        loraFC2OutputAdd(hidden_size, num_experts_per_node, expanded_num_rows, lora_params,
+                         fc2_result_, stream);
+        sync_check_cuda_error(stream);
+        finalizeMoeRoutingKernelLauncher<OutputType, UnfusedGemmOutputType>(
+            static_cast<UnfusedGemmOutputType const*>(fc2_result_), final_output, fc2_expert_biases,
+            token_topk_unpermuted_scales, unpermuted_row_to_permuted_row,
+            permuted_row_to_unpermuted_row_, token_selected_experts, expert_first_token_offset_,
+            num_rows, hidden_size, unpadded_hidden_size, experts_per_token, num_experts_per_node,
+            parallelism_config, enable_alltoall, enable_pdl, stream);
+      }
+      sync_check_cuda_error(stream);
+    }
   }
 }
 
@@ -4041,7 +7653,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
                                   ScaleBiasType const* fc2_expert_biases, bool min_latency_mode,
                                   MoeMinLatencyParams& min_latency_params, bool use_lora,
                                   int start_expert, MOEParallelismConfig parallelism_config,
-                                  bool enable_pdl, cudaStream_t stream) {
+                                  bool allow_lora_finalize_fusion, bool enable_pdl,
+                                  cudaStream_t stream) {
   auto gemm1_tma_ws_input = tma_ws_grouped_gemm1_input_;
   auto gemm2_tma_ws_input = tma_ws_grouped_gemm2_input_;
 
@@ -4101,8 +7714,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
     bool gemm2_using_finalize_fusion =
         gemm2_config_->epilogue_fusion_type ==
         cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
-    bool using_fused_finalize =
-        use_fused_finalize_ && gemm2_using_finalize_fusion && !use_w4_groupwise && !use_lora;
+    bool using_fused_finalize = use_fused_finalize_ && gemm2_using_finalize_fusion &&
+                                !use_w4_groupwise && (!use_lora || allow_lora_finalize_fusion);
     TLLM_CHECK_WITH_INFO(
         using_fused_finalize == gemm2_using_finalize_fusion,
         "GEMM2 tactic requests finalize fusion, but the runner is not configured to use it");
@@ -4657,7 +8270,7 @@ void GemmProfilerBackend::prepareTmaWsInputs(
   bool const use_finalize_fusion =
       fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE;
   bool const finalize_fusion_not_supported = !mInterface->use_fused_finalize_ || mMinLatencyMode ||
-                                             use_w4_groupwise ||
+                                             use_w4_groupwise || mUseLora ||
                                              mGemmToProfile != GemmToProfile::GEMM_2;
   if (use_finalize_fusion && finalize_fusion_not_supported) {
     return;
@@ -4861,9 +8474,12 @@ void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tac
     bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
     bool finalize_supported_this_gemm = (mGemmToProfile == GemmToProfile::GEMM_2) &&
                                         mInterface->use_fused_finalize_ && !mMinLatencyMode &&
-                                        !use_w4_groupwise;
+                                        !use_w4_groupwise && !mUseLora;
     bool request_finalize = tactic.epilogue_fusion_type ==
                             cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
+    TLLM_CHECK_WITH_INFO(
+        !request_finalize || finalize_supported_this_gemm,
+        "GEMM tactic requests finalize fusion, but profiler is not configured to use it");
     bool use_finalize_index = request_finalize && finalize_supported_this_gemm;
 
     tma_ws_input_template = mTmaInputCache[use_finalize_index][tactic.swap_ab][mSampleIndex];

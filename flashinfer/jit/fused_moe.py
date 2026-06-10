@@ -213,7 +213,7 @@ def gen_cutlass_fused_moe_module(
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/lora/lora.cpp",
+            / "nv_internal/tensorrt_llm/kernels/lora/lora_kernels.cu",
         ],
         extra_cuda_cflags=nvcc_flags,
         extra_cflags=["-DFAST_BUILD"] if use_fast_build else [],

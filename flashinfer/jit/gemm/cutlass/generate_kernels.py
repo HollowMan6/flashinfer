@@ -253,6 +253,7 @@ GroupedGemmInput<{act_tag}, {weight_tag}, {out_tag}, {out_tag}>inputs, TmaWarpSp
             assert operation.mainloop_schedule in [
                 KernelScheduleType.TmaWarpSpecializedCooperative,
                 KernelScheduleType.TmaWarpSpecializedCooperativeFP8FastAccum,
+                KernelScheduleType.TmaWarpSpecializedPingpong,
             ]
             kernel_sched.replace("::Kernel", "::KernelGrouped")
             # epi_sched += "Grouped"
@@ -464,6 +465,19 @@ def is_grouped_gemm_op_valid(op):
         return False
 
     if (
+        op.arch == 90
+        and op.act_type == DataType.bf16
+        and op.weight_type == DataType.bf16
+        and op.output_type == DataType.bf16
+        and op.cta_shape[:2] == (128, 64)
+        and op.cga_shape in ((1, 1, 1), (2, 1, 1))
+        and op.mainloop_schedule == KernelScheduleType.TmaWarpSpecializedPingpong
+        and op.epi_schedule == EpilogueScheduleType.PtrArrayTmaWarpSpecializedPingpong
+        and op.swap_ab
+    ):
+        return True
+
+    if (
         op.epi_schedule is not None
         and op.epi_schedule != EpilogueScheduleType.NoSmemWarpSpecialized
     ):
@@ -644,6 +658,35 @@ def generate_sm90_grouped_gemm_operations(is_arch_enabled):
 
             if is_op_valid(moe_gemm_operation):
                 operations.append(moe_gemm_operation)
+
+            if (
+                dtype == DataType.bf16
+                and otype == DataType.bf16
+                and cta_shape_mn == (128, 64)
+                and cga_shape in ((1, 1, 1), (2, 1, 1))
+                and swap_ab
+            ):
+                pingpong_operation = TrtLlm_GemmLauncher(
+                    GemmKind.Grouped,
+                    arch,
+                    dtype,
+                    dtype,
+                    dtype,
+                    dtype,
+                    otype,
+                    quant_op,
+                    epi_tag,
+                    cta_shape_mnk,
+                    warp_shape,
+                    stages,
+                    cga_shape,
+                    KernelScheduleType.TmaWarpSpecializedPingpong,
+                    EpilogueScheduleType.PtrArrayTmaWarpSpecializedPingpong,
+                    epi_fusion,
+                    swap_ab=swap_ab,
+                )
+                if is_op_valid(pingpong_operation):
+                    operations.append(pingpong_operation)
     return operations
 
 

@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 import math
+import os
 from dataclasses import dataclass
 from enum import IntEnum
 from types import SimpleNamespace
@@ -190,6 +191,111 @@ def get_w2_permute_indices_with_cache(
     return permute_indices
 
 
+@functools.cache
+def _is_h20_device_index(device_index: int) -> bool:
+    return "H20" in torch.cuda.get_device_name(device_index)
+
+
+def _is_h20_device(device: torch.device) -> bool:
+    return _is_h20_device_index(
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+
+
+def _autotuner_is_tuning() -> bool:
+    tuner = getattr(AutoTuner, "_instance", None)
+    return tuner is not None and tuner.is_tuning_mode
+
+
+def _get_h20_glm_bf16_moe_profile_ids(
+    device_arch: str,
+    input: torch.Tensor,
+    token_selected_experts: torch.Tensor,
+    fc1_expert_weights: torch.Tensor,
+    fc2_expert_weights: torch.Tensor,
+    output_dtype: torch.dtype,
+    *,
+    enable_pdl: bool,
+    tp_size: int,
+    tp_rank: int,
+    ep_size: int,
+    ep_rank: int,
+    cluster_size: int,
+    cluster_rank: int,
+    enable_alltoall: bool,
+    use_deepseek_fp8_block_scale: bool,
+    use_w4_group_scaling: bool,
+    use_mxfp8_act_scaling: bool,
+    min_latency_mode: bool,
+    activation_type: ActivationType,
+    use_packed_weights: bool,
+    use_lora: bool,
+) -> Optional[Tuple[int, int]]:
+    if (
+        device_arch != "90"
+        or not use_lora
+        or (not enable_pdl and input.shape[0] < 32768)
+        or input.dtype != torch.bfloat16
+        or fc1_expert_weights.dtype != torch.bfloat16
+        or fc2_expert_weights.dtype != torch.bfloat16
+        or output_dtype != torch.bfloat16
+        or token_selected_experts.size(1) != 8
+        or tuple(fc1_expert_weights.shape) != (256, 4096, 6144)
+        or tuple(fc2_expert_weights.shape) != (256, 6144, 2048)
+        or tp_size != 1
+        or tp_rank != 0
+        or ep_size != 1
+        or ep_rank != 0
+        or cluster_size != 1
+        or cluster_rank != 0
+        or enable_alltoall
+        or use_deepseek_fp8_block_scale
+        or use_w4_group_scaling
+        or use_mxfp8_act_scaling
+        or min_latency_mode
+        or activation_type != ActivationType.Swiglu
+        or use_packed_weights
+    ):
+        return None
+
+    if not _is_h20_device(input.device):
+        return None
+
+    # Kernel-level profile-pair sweep on H20-3e, GLM-5.1 BF16 MoE
+    # E=256, H=6144, I=2048, top_k=8.
+    num_rows = input.shape[0]
+    # These are full-build SM90 module profile IDs. LoRA uses grouped
+    # low-rank side kernels and a token finalizer, so it cannot use the
+    # finalize-fusion GEMM2 tactics selected by the non-LoRA table.
+    if num_rows <= 320:
+        return (19, 82)
+    if num_rows <= 512:
+        return (18, 81)
+    if num_rows <= 960:
+        return (20, 83)
+    if num_rows <= 1024:
+        return (20, 84)
+    if num_rows <= 1408:
+        return (18, 84)
+    if num_rows >= 32768:
+        return (22, 86)
+    return (20, 83)
+
+
+def _h20_glm_bf16_lora_32k_tma_env_defaults(
+    static_profile_ids: Optional[Tuple[int, int]],
+) -> Dict[str, str]:
+    if static_profile_ids != (22, 86):
+        return {}
+
+    defaults: Dict[str, str] = {}
+    if "FLASHINFER_CUTLASS_MOE_SM90_BF16_PINGPONG" not in os.environ:
+        defaults["FLASHINFER_CUTLASS_MOE_SM90_BF16_PINGPONG"] = "all"
+    if "FLASHINFER_CUTLASS_MOE_TMA_GEMM2_SMS" not in os.environ:
+        defaults["FLASHINFER_CUTLASS_MOE_TMA_GEMM2_SMS"] = "74"
+    return defaults
+
+
 def get_reorder_rows_for_gated_act_gemm_row_indices(x) -> torch.Tensor:
     """
     Reorders rows in the gemm/MOE_gemm weight matrix for min-latency
@@ -294,6 +400,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             enable_pdl: bool,
             activation_type: ActivationType,
             use_packed_weights: bool,
+            use_lora: bool,
         ):
             self.x_dtype = x_dtype
             self.weight_dtype = weight_dtype
@@ -312,6 +419,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             self.min_latency_mode = min_latency_mode
             self.enable_pdl = enable_pdl
             self.use_packed_weights = use_packed_weights
+            self.use_lora = use_lora
             instance_key = (
                 x_dtype,
                 weight_dtype,
@@ -358,6 +466,10 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 all_tactics = list(range(gemm1_count, gemm1_count + gemm2_count))
             else:
                 all_tactics = list(range(total))
+
+            if self.use_lora and stage == 2:
+                is_finalize = self.fused_moe_runner.is_tactic_finalize_fusion
+                all_tactics = [t for t in all_tactics if not is_finalize(t)]
 
             # Pre-filter tactics with zero occupancy on the current device.
             # This eliminates tactics that would fail during profiling with
@@ -426,6 +538,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 do_preparation,
                 self.enable_pdl,
                 self.activation_type,
+                self.use_lora,
             )
 
         @classmethod
@@ -477,18 +590,37 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         enable_pdl: Optional[bool] = None,
         activation_type: ActivationType = ActivationType.Swiglu,
         use_packed_weights: bool = False,
+        token_lora_indices: Optional[torch.Tensor] = None,
+        fc1_lora_ranks: Optional[torch.Tensor] = None,
+        fc1_lora_weight_ptrs: Optional[torch.Tensor] = None,
+        fc2_lora_ranks: Optional[torch.Tensor] = None,
+        fc2_lora_weight_ptrs: Optional[torch.Tensor] = None,
+        gated_lora_ranks: Optional[torch.Tensor] = None,
+        gated_lora_weight_ptrs: Optional[torch.Tensor] = None,
+        lora_max_rank: int = 0,
     ) -> List[torch.Tensor]:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
-        tuner = AutoTuner.get()
-        MoERunner.refine_tuning_config(tune_max_num_tokens)
-
-        # allocate workspace for profiling
-        moe_runner = MoERunner(
-            x_dtype=input.dtype,
-            weight_dtype=fc1_expert_weights.dtype,
-            output_dtype=output_dtype,
-            top_k=token_selected_experts.size(1),
+        use_lora = any(
+            arg is not None
+            for arg in (
+                token_lora_indices,
+                fc1_lora_ranks,
+                fc1_lora_weight_ptrs,
+                fc2_lora_ranks,
+                fc2_lora_weight_ptrs,
+                gated_lora_ranks,
+                gated_lora_weight_ptrs,
+            )
+        )
+        static_profile_ids = _get_h20_glm_bf16_moe_profile_ids(
+            backend,
+            input,
+            token_selected_experts,
+            fc1_expert_weights,
+            fc2_expert_weights,
+            output_dtype,
+            enable_pdl=enable_pdl,
             tp_size=tp_size,
             tp_rank=tp_rank,
             ep_size=ep_size,
@@ -500,109 +632,164 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             use_w4_group_scaling=use_w4_group_scaling,
             use_mxfp8_act_scaling=use_mxfp8_act_scaling,
             min_latency_mode=min_latency_mode,
-            enable_pdl=enable_pdl,
             activation_type=activation_type,
             use_packed_weights=use_packed_weights,
+            use_lora=use_lora,
         )
+        if static_profile_ids == (22, 86):
+            enable_pdl = False
 
-        # Limit tactics to GEMM1 during tuning
-        moe_runner.gemm_idx_for_tuning = 1
-        _, gemm_tactic_1 = tuner.choose_one(
-            "trtllm::fused_moe::gemm1",
-            [moe_runner],
-            MoERunner.tuning_config,
-            [
+        if static_profile_ids is not None and not _autotuner_is_tuning():
+            gemm_tactic_1, gemm_tactic_2 = static_profile_ids
+            runner_key = (
+                input.dtype,
+                fc1_expert_weights.dtype,
+                output_dtype,
+                use_deepseek_fp8_block_scale,
+                use_w4_group_scaling,
+                use_mxfp8_act_scaling,
+                use_packed_weights,
+            )
+            fused_moe_runner = MoERunner.runner_dict.get(runner_key)
+            if fused_moe_runner is None:
+                fused_moe_runner = module.init(
+                    input.dtype,
+                    fc1_expert_weights.dtype,
+                    output_dtype,
+                    use_deepseek_fp8_block_scale,
+                    use_w4_group_scaling,
+                    use_mxfp8_act_scaling,
+                    use_packed_weights,
+                )
+                MoERunner.runner_dict[runner_key] = fused_moe_runner
+        else:
+            tuner = AutoTuner.get()
+            MoERunner.refine_tuning_config(tune_max_num_tokens)
+
+            # allocate workspace for profiling
+            moe_runner = MoERunner(
+                x_dtype=input.dtype,
+                weight_dtype=fc1_expert_weights.dtype,
+                output_dtype=output_dtype,
+                top_k=token_selected_experts.size(1),
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                ep_size=ep_size,
+                ep_rank=ep_rank,
+                cluster_size=cluster_size,
+                cluster_rank=cluster_rank,
+                enable_alltoall=enable_alltoall,
+                use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+                use_w4_group_scaling=use_w4_group_scaling,
+                use_mxfp8_act_scaling=use_mxfp8_act_scaling,
+                min_latency_mode=min_latency_mode,
+                enable_pdl=enable_pdl,
+                activation_type=activation_type,
+                use_packed_weights=use_packed_weights,
+                use_lora=use_lora,
+            )
+            fused_moe_runner = moe_runner.fused_moe_runner
+
+            moe_inputs = [
                 input,
                 fc1_expert_weights,
                 fc1_expert_biases,
                 fc2_expert_weights,
                 fc2_expert_biases,
-            ],
-            gemm_idx=1,
-        )
+            ]
+            # Limit tactics to GEMM1 during tuning.
+            moe_runner.gemm_idx_for_tuning = 1
+            _, gemm_tactic_1 = tuner.choose_one(
+                "trtllm::fused_moe::gemm1",
+                [moe_runner],
+                MoERunner.tuning_config,
+                moe_inputs,
+                gemm_idx=1,
+            )
 
-        # Limit tactics to GEMM2 during tuning
-        moe_runner.gemm_idx_for_tuning = 2
-        _, gemm_tactic_2 = tuner.choose_one(
-            "trtllm::fused_moe::gemm2",
-            [moe_runner],
-            MoERunner.tuning_config,
-            [
-                input,
-                fc1_expert_weights,
-                fc1_expert_biases,
-                fc2_expert_weights,
-                fc2_expert_biases,
-            ],
-            gemm_idx=2,
-        )
+            # Limit tactics to GEMM2 during tuning.
+            moe_runner.gemm_idx_for_tuning = 2
+            _, gemm_tactic_2 = tuner.choose_one(
+                "trtllm::fused_moe::gemm2",
+                [moe_runner],
+                MoERunner.tuning_config,
+                moe_inputs,
+                gemm_idx=2,
+            )
 
         run_moe = (
-            moe_runner.fused_moe_runner.run_moe_min_latency
+            fused_moe_runner.run_moe_min_latency
             if min_latency_mode
-            else moe_runner.fused_moe_runner.run_moe
+            else fused_moe_runner.run_moe
         )
-        num_active_experts_per_node = torch.empty(
-            (1,), dtype=torch.int32, device=input.device
-        )
-        experts_to_token_score = torch.empty(
-            (fc2_expert_weights.shape[0], input.shape[0]),
-            dtype=torch.float32,
-            device=input.device,
-        )
-        active_expert_global_ids = torch.empty(
-            (fc2_expert_weights.shape[0],),
-            dtype=torch.int32,
-            device=input.device,
-        )
-        min_latency_output = (
-            [
+        tma_env_defaults = _h20_glm_bf16_lora_32k_tma_env_defaults(static_profile_ids)
+        min_latency_output = []
+        if min_latency_mode:
+            num_active_experts_per_node = torch.empty(
+                (1,), dtype=torch.int32, device=input.device
+            )
+            experts_to_token_score = torch.empty(
+                (fc2_expert_weights.shape[0], input.shape[0]),
+                dtype=torch.float32,
+                device=input.device,
+            )
+            active_expert_global_ids = torch.empty(
+                (fc2_expert_weights.shape[0],),
+                dtype=torch.int32,
+                device=input.device,
+            )
+            min_latency_output = [
                 num_active_experts_per_node,
                 experts_to_token_score,
                 active_expert_global_ids,
             ]
-            if min_latency_mode
-            else []
-        )
-        run_moe(
-            output,
-            input,
-            token_selected_experts,
-            token_final_scales,
-            fc1_expert_weights,
-            fc1_expert_biases,
-            fc2_expert_weights,
-            fc2_expert_biases,
-            quant_scales,
-            input_sf,
-            swiglu_alpha,
-            swiglu_beta,
-            swiglu_limit,
-            swizzled_input_sf,
-            *min_latency_output,
-            tp_size,
-            tp_rank,
-            ep_size,
-            ep_rank,
-            cluster_size,
-            cluster_rank,
-            enable_alltoall,
-            min_latency_mode,
-            [gemm_tactic_1, gemm_tactic_2],
-            enable_pdl,
-            activation_type,
-        )
-
-        return (
-            output
-            if min_latency_mode
-            else [
+        old_env = {key: os.environ.get(key) for key in tma_env_defaults}
+        try:
+            os.environ.update(tma_env_defaults)
+            run_moe(
                 output,
-                num_active_experts_per_node,
-                experts_to_token_score,
-                active_expert_global_ids,
-            ]
-        )
+                input,
+                token_selected_experts,
+                token_final_scales,
+                fc1_expert_weights,
+                fc1_expert_biases,
+                fc2_expert_weights,
+                fc2_expert_biases,
+                quant_scales,
+                input_sf,
+                swiglu_alpha,
+                swiglu_beta,
+                swiglu_limit,
+                swizzled_input_sf,
+                *min_latency_output,
+                tp_size,
+                tp_rank,
+                ep_size,
+                ep_rank,
+                cluster_size,
+                cluster_rank,
+                enable_alltoall,
+                min_latency_mode,
+                [gemm_tactic_1, gemm_tactic_2],
+                enable_pdl,
+                token_lora_indices,
+                fc1_lora_ranks,
+                fc1_lora_weight_ptrs,
+                fc2_lora_ranks,
+                fc2_lora_weight_ptrs,
+                gated_lora_ranks,
+                gated_lora_weight_ptrs,
+                lora_max_rank,
+                activation_type,
+            )
+        finally:
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        return output if min_latency_mode else [output]
 
     @register_fake_op("flashinfer::cutlass_fused_moe")
     def _fake_cutlass_fused_moe(
@@ -634,7 +821,16 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         min_latency_mode: bool = False,
         tune_max_num_tokens: int = 8192,
         enable_pdl: Optional[bool] = None,
+        activation_type: ActivationType = ActivationType.Swiglu,
         use_packed_weights: bool = False,
+        token_lora_indices: Optional[torch.Tensor] = None,
+        fc1_lora_ranks: Optional[torch.Tensor] = None,
+        fc1_lora_weight_ptrs: Optional[torch.Tensor] = None,
+        fc2_lora_ranks: Optional[torch.Tensor] = None,
+        fc2_lora_weight_ptrs: Optional[torch.Tensor] = None,
+        gated_lora_ranks: Optional[torch.Tensor] = None,
+        gated_lora_weight_ptrs: Optional[torch.Tensor] = None,
+        lora_max_rank: int = 0,
     ):
         seq_len = input.shape[0]
         hidden_size = fc2_expert_weights.shape[1]
@@ -805,6 +1001,14 @@ def cutlass_fused_moe(
     enable_pdl: Optional[bool] = None,
     activation_type: ActivationType = ActivationType.Swiglu,
     swizzled_input_sf: bool = True,
+    token_lora_indices: Optional[torch.Tensor] = None,
+    fc1_lora_ranks: Optional[torch.Tensor] = None,
+    fc1_lora_weight_ptrs: Optional[torch.Tensor] = None,
+    fc2_lora_ranks: Optional[torch.Tensor] = None,
+    fc2_lora_weight_ptrs: Optional[torch.Tensor] = None,
+    gated_lora_ranks: Optional[torch.Tensor] = None,
+    gated_lora_weight_ptrs: Optional[torch.Tensor] = None,
+    lora_max_rank: int = 0,
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
 
@@ -921,6 +1125,22 @@ def cutlass_fused_moe(
         communication where the scaling factors are received in linear (non-swizzled) format.
         Only relevant when input_sf is not None.
 
+    token_lora_indices : Optional[torch.Tensor]
+        CUDA int32/int64 tensor with one LoRA adapter index per input token. ``-1`` means
+        no LoRA for that token.
+
+    fc1_lora_ranks, fc2_lora_ranks, gated_lora_ranks : Optional[torch.Tensor]
+        CUDA int32 tensors with one math LoRA rank per adapter. The rank can be smaller than
+        ``lora_max_rank`` for padded storage. Gated activations require ``gated_lora_ranks``.
+
+    fc1_lora_weight_ptrs, fc2_lora_weight_ptrs, gated_lora_weight_ptrs : Optional[torch.Tensor]
+        CUDA int64/uint64 tensors containing ``[A, B]`` device pointers per adapter. The
+        pointed weights are expected in expert-major LoRA layout padded to ``lora_max_rank``
+        and are offset by the selected expert inside the kernel.
+
+    lora_max_rank : int = 0
+        Maximum LoRA storage rank used to compute expert strides.
+
     Returns
     -------
     out: torch.Tensor
@@ -932,6 +1152,8 @@ def cutlass_fused_moe(
     NotImplementedError:
         If any of the following features are requested but not implemented:
             - Minimum Latency Mode
+            - LoRA with Minimum Latency Mode
+            - LoRA with expert parallelism or all-to-all
 
     Note
     ----
@@ -942,6 +1164,25 @@ def cutlass_fused_moe(
     """
     major, minor = torch.cuda.get_device_capability()
     device_arch = f"{major * 10 + minor}"
+
+    has_lora_args = any(
+        arg is not None
+        for arg in (
+            token_lora_indices,
+            fc1_lora_ranks,
+            fc1_lora_weight_ptrs,
+            fc2_lora_ranks,
+            fc2_lora_weight_ptrs,
+            gated_lora_ranks,
+            gated_lora_weight_ptrs,
+        )
+    )
+    if has_lora_args:
+        if ep_size != 1 or ep_rank != 0 or enable_alltoall:
+            raise NotImplementedError(
+                "CUTLASS MoE LoRA does not support expert parallelism or "
+                "all-to-all yet."
+            )
 
     if min_latency_mode:
         raise NotImplementedError("min latency mode not yet implemented for Blackwell.")
@@ -1003,6 +1244,14 @@ def cutlass_fused_moe(
         tune_max_num_tokens=tune_max_num_tokens,
         enable_pdl=enable_pdl,
         activation_type=activation_type,
+        token_lora_indices=token_lora_indices,
+        fc1_lora_ranks=fc1_lora_ranks,
+        fc1_lora_weight_ptrs=fc1_lora_weight_ptrs,
+        fc2_lora_ranks=fc2_lora_ranks,
+        fc2_lora_weight_ptrs=fc2_lora_weight_ptrs,
+        gated_lora_ranks=gated_lora_ranks,
+        gated_lora_weight_ptrs=gated_lora_weight_ptrs,
+        lora_max_rank=lora_max_rank,
     )
 
 

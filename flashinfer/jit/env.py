@@ -148,17 +148,61 @@ def _get_workspace_dir_name() -> pathlib.Path:
 FLASHINFER_WORKSPACE_DIR: pathlib.Path = _get_workspace_dir_name()
 FLASHINFER_JIT_DIR: pathlib.Path = FLASHINFER_WORKSPACE_DIR / "cached_ops"
 FLASHINFER_GEN_SRC_DIR: pathlib.Path = FLASHINFER_WORKSPACE_DIR / "generated"
-FLASHINFER_DATA: pathlib.Path = _package_root / "data"
-FLASHINFER_INCLUDE_DIR: pathlib.Path = _package_root / "data" / "include"
-FLASHINFER_CSRC_DIR: pathlib.Path = _package_root / "data" / "csrc"
-# FLASHINFER_SRC_DIR = _package_root / "data" / "src"
-CUTLASS_INCLUDE_DIRS: list[pathlib.Path] = [
-    _package_root / "data" / "cutlass" / "include",
-    _package_root / "data" / "cutlass" / "tools" / "util" / "include",
-]
-SPDLOG_INCLUDE_DIR: pathlib.Path = _package_root / "data" / "spdlog" / "include"
-CCCL_INCLUDE_DIRS: list[pathlib.Path] = [
-    _package_root / "data" / "cccl" / "cub",
-    _package_root / "data" / "cccl" / "libcudacxx" / "include",
-    _package_root / "data" / "cccl" / "thrust",
-]
+
+
+def _resolve_data_paths() -> tuple[
+    pathlib.Path,
+    pathlib.Path,
+    pathlib.Path,
+    list[pathlib.Path],
+    pathlib.Path,
+    list[pathlib.Path],
+]:
+    data_dir = _package_root / "data"
+    packaged_paths = (
+        data_dir,
+        data_dir / "include",
+        data_dir / "csrc",
+        [
+            data_dir / "cutlass" / "include",
+            data_dir / "cutlass" / "tools" / "util" / "include",
+        ],
+        data_dir / "spdlog" / "include",
+        [
+            data_dir / "cccl" / "cub",
+            data_dir / "cccl" / "libcudacxx" / "include",
+            data_dir / "cccl" / "thrust",
+        ],
+    )
+    if (data_dir / "csrc").is_dir():
+        return packaged_paths
+
+    source_root = _package_root.parent
+    if (source_root / "csrc").is_dir() and (source_root / "include").is_dir():
+        return (
+            source_root,
+            source_root / "include",
+            source_root / "csrc",
+            [
+                source_root / "3rdparty" / "cutlass" / "include",
+                source_root / "3rdparty" / "cutlass" / "tools" / "util" / "include",
+            ],
+            source_root / "3rdparty" / "spdlog" / "include",
+            [
+                source_root / "3rdparty" / "cccl" / "cub",
+                source_root / "3rdparty" / "cccl" / "libcudacxx" / "include",
+                source_root / "3rdparty" / "cccl" / "thrust",
+            ],
+        )
+
+    return packaged_paths
+
+
+(
+    FLASHINFER_DATA,
+    FLASHINFER_INCLUDE_DIR,
+    FLASHINFER_CSRC_DIR,
+    CUTLASS_INCLUDE_DIRS,
+    SPDLOG_INCLUDE_DIR,
+    CCCL_INCLUDE_DIRS,
+) = _resolve_data_paths()

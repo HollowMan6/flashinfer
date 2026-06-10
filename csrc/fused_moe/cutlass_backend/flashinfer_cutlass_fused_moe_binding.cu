@@ -30,6 +30,7 @@
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_mixed_utils.h"
+#include "tensorrt_llm/kernels/lora/lora.h"
 
 namespace common = tensorrt_llm::common;
 namespace kernels = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE;
@@ -74,7 +75,7 @@ class DtypeUtils {
         TVM_FFI_ICHECK(false) << "unsupported data type";
     }
 
-    return nvinfer1::DataType::kFLOAT;  // supress compiler warning
+    return nvinfer1::DataType::kFLOAT;  // suppress compiler warning
   }
 
  private:
@@ -92,7 +93,6 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         TVM_FFI_LOG_AND_THROW(NotImplementedError)
             << "Outputting " << DLDataTypeToString(output_type)
             << " directly is not currently supported";
-        // return std::make_unique<kernels::CutlassMoeFCRunner<Type, Type>>();
       case float16_code:
         if constexpr (NeedQuant) {
           return std::make_unique<
@@ -116,7 +116,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                               << " specified for " << DLDataTypeToString(mActivationDtype);
     }
 
-    return nullptr;  // supress compiler warning
+    return nullptr;  // suppress compiler warning
   };
 
   FusedMoeRunner(DLDataType activation_dtype, DLDataType weight_dtype, DLDataType output_dtype,
@@ -251,6 +251,10 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
               bool swizzled_input_sf, int64_t tp_size, int64_t tp_rank, int64_t ep_size,
               int64_t ep_rank, int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
               bool min_latency_mode, Optional<Array<int64_t>> profile_ids, bool enable_pdl,
+              Optional<TensorView> token_lora_indices, Optional<TensorView> fc1_lora_ranks,
+              Optional<TensorView> fc1_lora_weight_ptrs, Optional<TensorView> fc2_lora_ranks,
+              Optional<TensorView> fc2_lora_weight_ptrs, Optional<TensorView> gated_lora_ranks,
+              Optional<TensorView> gated_lora_weight_ptrs, int64_t lora_max_rank,
               ActivationType base_activation_type = ActivationType::Swiglu) {
     std::lock_guard<std::mutex> lock(mMutex);
 
@@ -372,19 +376,49 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
     auto stream = get_stream(input.device());
 
+    bool const has_lora_args =
+        hasAnyLoraArg(token_lora_indices, fc1_lora_ranks, fc1_lora_weight_ptrs, fc2_lora_ranks,
+                      fc2_lora_weight_ptrs, gated_lora_ranks, gated_lora_weight_ptrs);
+    TVM_FFI_ICHECK(!has_lora_args || (ep_size == 1 && ep_rank == 0 && !enable_alltoall))
+        << "CUTLASS MoE LoRA does not support expert parallelism or all-to-all yet";
+
+    LoraInfo lora_info =
+        prepareLoraInfo(num_rows, experts_per_token, hidden_size, inter_size, num_experts_on_rank,
+                        base_activation_type, token_lora_indices, fc1_lora_ranks,
+                        fc1_lora_weight_ptrs, fc2_lora_ranks, fc2_lora_weight_ptrs,
+                        gated_lora_ranks, gated_lora_weight_ptrs, lora_max_rank);
+
     WorkspaceInfo workspace_info = getWorkspaceInfo(
         num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
-        base_activation_type, parallelism_config, min_latency_mode);
+        base_activation_type, parallelism_config, min_latency_mode, lora_info.use_lora,
+        lora_info.workspace_size);
 
     auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size,
                                              quant_scales, base_activation_type);
     kernels::MoeMinLatencyParams min_latency_params{};
 
-    // TODO: support lora in the future
     ::tensorrt_llm::kernels::LoraParams lora_params{};
-    // HACK Define default values for parameters we don't have good values for
-    int64_t const unpadded_hidden_size = hidden_size;  // Assume no padding by default
-    bool const use_lora = false;                       // No lora support yet
+    if (lora_info.use_lora) {
+      auto* lora_workspace_base = static_cast<char*>(workspace_info.lora_workspace);
+      lora_params = ::tensorrt_llm::kernels::LoraParams(
+          static_cast<int>(num_rows),
+          static_cast<int32_t const*>(fc1_lora_ranks.value().data_ptr()),
+          reinterpret_cast<void const* const*>(fc1_lora_weight_ptrs.value().data_ptr()),
+          static_cast<int32_t const*>(fc2_lora_ranks.value().data_ptr()),
+          reinterpret_cast<void const* const*>(fc2_lora_weight_ptrs.value().data_ptr()),
+          lora_info.fc1_lora_impl, lora_info.fc1_gated_lora_impl, lora_info.fc2_lora_impl,
+          lora_workspace_base + lora_info.run_workspace_offset, lora_workspace_base,
+          token_lora_indices.value().data_ptr(), token_lora_indices.value().dtype() == dl_int64,
+          static_cast<int>(lora_info.num_lora_adapters), static_cast<int>(lora_info.max_low_rank),
+          gated_lora_ranks.has_value()
+              ? static_cast<int32_t const*>(gated_lora_ranks.value().data_ptr())
+              : nullptr,
+          gated_lora_weight_ptrs.has_value()
+              ? reinterpret_cast<void const* const*>(gated_lora_weight_ptrs.value().data_ptr())
+              : nullptr);
+    }
+    int64_t const unpadded_hidden_size = hidden_size;
+    bool const use_lora = lora_info.use_lora;
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
     mKernelRunner->runMoe(
         input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
@@ -416,9 +450,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         quant_params, num_rows, hidden_size, inter_size, num_experts_total,
         static_cast<int>(experts_per_token),
         static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
-        static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
-        mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling, min_latency_mode, min_latency_params,
-        enable_pdl, stream);
+        static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, use_lora,
+        lora_params, mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling, min_latency_mode,
+        min_latency_params, enable_pdl, stream);
 #endif
   }
 
@@ -516,7 +550,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     if (swiglu_beta.has_value()) {
       CHECK_INPUT_AND_TYPE(swiglu_beta.value(), dl_float32);
       TVM_FFI_ICHECK_EQ(swiglu_beta.value().size(0), num_experts_on_rank)
-      "swiglu_beta must have num_experts_on_rank elements.";
+          << "swiglu_beta must have num_experts_on_rank elements.";
       base_activation_type = ActivationType::SwigluBias;
     }
     if (swiglu_limit.has_value()) {
@@ -561,16 +595,15 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
     WorkspaceInfo workspace_info = getWorkspaceInfo(
         num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
-        base_activation_type, parallelism_config, min_latency_mode);
+        base_activation_type, parallelism_config, min_latency_mode, /*use_lora=*/false,
+        /*lora_workspace_size=*/0);
 
     auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size,
                                              quant_scales, base_activation_type);
 
-    // TODO: support lora in the future
     ::tensorrt_llm::kernels::LoraParams lora_params{};
-    // HACK Define default values for parameters we don't have good values for
-    int64_t const unpadded_hidden_size_ml = hidden_size;  // Assume no padding by default
-    bool const use_lora_ml = false;                       // No lora support yet
+    int64_t const unpadded_hidden_size_ml = hidden_size;
+    bool const use_lora_ml = false;
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
     mKernelRunner->runMoe(
         input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
@@ -619,7 +652,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                       int64_t tp_rank, int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
                       int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
                       int64_t gemm_idx, int64_t profile_id, bool do_preparation, bool enable_pdl,
-                      ActivationType activation_type) {
+                      ActivationType activation_type, bool use_lora) {
     std::lock_guard<std::mutex> lock(mMutex);
 
     // TODO: support profiling under fp8 block scaling in the future
@@ -662,11 +695,11 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           static_cast<int>(cluster_rank));
 
       bool USE_BIAS = fc1_expert_biases.has_value() || fc2_expert_biases.has_value();
-      bool USE_LORA = false;
+      bool USE_LORA = use_lora;
       auto activation_dtype =
           (mUseW4GroupScaling && !isWFP4A16Quant()) ? dl_float8_e4m3fn : mActivationDtype;
       activation_dtype = isNvfp4Quant() ? dl_int64 : activation_dtype;
-      int64_t const unpadded_hidden_size_profiler = hidden_size;  // HACK no padding by default
+      int64_t const unpadded_hidden_size_profiler = hidden_size;
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
       mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
                       DtypeUtils::dataType(activation_dtype), DtypeUtils::dataType(mWeightDtype),
@@ -708,12 +741,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                  int64_t tp_rank, int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
                  int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
                  int64_t gemm_idx, int64_t profile_id, bool do_preparation, bool enable_pdl,
-                 int64_t activation_type) {
+                 int64_t activation_type, bool use_lora) {
             runGemmProfile(input, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
                            fc2_expert_biases, top_k, tp_size, tp_rank, ep_size, ep_rank,
                            cluster_size, cluster_rank, enable_alltoall, min_latency_mode, gemm_idx,
                            profile_id, do_preparation, enable_pdl,
-                           static_cast<ActivationType>(activation_type));
+                           static_cast<ActivationType>(activation_type), use_lora);
           });
     } else if (name == "get_tactic_num") {
       return Function::FromTyped([this]() -> int64_t { return getTacticNum(); });
@@ -733,6 +766,15 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         return static_cast<int64_t>(
             mKernelRunner->queryOccupancyForConfig(mAllProfiles[tactic_id]));
       });
+    } else if (name == "is_tactic_finalize_fusion") {
+      return Function::FromTyped([this](int64_t tactic_id) -> bool {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (tactic_id < 0 || tactic_id >= static_cast<int64_t>(mAllProfiles.size())) {
+          return false;
+        }
+        return mAllProfiles[tactic_id].epilogue_fusion_type ==
+               tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
+      });
     } else if (name == "run_moe") {
       return Function::FromTyped(
           [this](TensorView output, TensorView input, TensorView token_selected_experts,
@@ -744,12 +786,19 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                  bool swizzled_input_sf, int64_t tp_size, int64_t tp_rank, int64_t ep_size,
                  int64_t ep_rank, int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
                  bool min_latency_mode, Optional<Array<int64_t>> profile_ids, bool enable_pdl,
+                 Optional<TensorView> token_lora_indices, Optional<TensorView> fc1_lora_ranks,
+                 Optional<TensorView> fc1_lora_weight_ptrs, Optional<TensorView> fc2_lora_ranks,
+                 Optional<TensorView> fc2_lora_weight_ptrs, Optional<TensorView> gated_lora_ranks,
+                 Optional<TensorView> gated_lora_weight_ptrs, int64_t lora_max_rank,
                  int64_t base_activation_type) {
             runMoe(output, input, token_selected_experts, token_final_scales, fc1_expert_weights,
                    fc1_expert_biases, fc2_expert_weights, fc2_expert_biases, quant_scales, input_sf,
                    swiglu_alpha, swiglu_beta, swiglu_limit, swizzled_input_sf, tp_size, tp_rank,
                    ep_size, ep_rank, cluster_size, cluster_rank, enable_alltoall, min_latency_mode,
-                   profile_ids, enable_pdl, static_cast<ActivationType>(base_activation_type));
+                   profile_ids, enable_pdl, token_lora_indices, fc1_lora_ranks,
+                   fc1_lora_weight_ptrs, fc2_lora_ranks, fc2_lora_weight_ptrs, gated_lora_ranks,
+                   gated_lora_weight_ptrs, lora_max_rank,
+                   static_cast<ActivationType>(base_activation_type));
           });
     } else if (name == "run_moe_min_latency") {
       return Function::FromTyped(
@@ -764,7 +813,16 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                  int64_t tp_size, int64_t tp_rank, int64_t ep_size, int64_t ep_rank,
                  int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
                  bool min_latency_mode, Optional<Array<int64_t>> profile_ids, bool enable_pdl,
+                 Optional<TensorView> token_lora_indices, Optional<TensorView> fc1_lora_ranks,
+                 Optional<TensorView> fc1_lora_weight_ptrs, Optional<TensorView> fc2_lora_ranks,
+                 Optional<TensorView> fc2_lora_weight_ptrs, Optional<TensorView> gated_lora_ranks,
+                 Optional<TensorView> gated_lora_weight_ptrs, int64_t lora_max_rank,
                  int64_t base_activation_type) {
+            TVM_FFI_ICHECK(!hasAnyLoraArg(token_lora_indices, fc1_lora_ranks, fc1_lora_weight_ptrs,
+                                          fc2_lora_ranks, fc2_lora_weight_ptrs, gated_lora_ranks,
+                                          gated_lora_weight_ptrs))
+                << "CUTLASS MoE LoRA does not support min latency mode";
+            (void)lora_max_rank;
             runMoeMinLantency(output, input, token_selected_experts, token_final_scales,
                               fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
                               fc2_expert_biases, quant_scales, input_sf, swiglu_alpha, swiglu_beta,
@@ -780,9 +838,21 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   }
 
  private:
+  struct LoraInfo {
+    bool use_lora = false;
+    int64_t max_low_rank = 0;
+    int64_t num_lora_adapters = 0;
+    size_t workspace_size = 0;
+    size_t run_workspace_offset = 0;
+    std::shared_ptr<::tensorrt_llm::kernels::LoraImpl> fc1_lora_impl;
+    std::shared_ptr<::tensorrt_llm::kernels::LoraImpl> fc1_gated_lora_impl;
+    std::shared_ptr<::tensorrt_llm::kernels::LoraImpl> fc2_lora_impl;
+  };
+
   struct WorkspaceInfo {
     Tensor workspace{};
     void* src_to_dest_map{};
+    void* lora_workspace{};
   };
 
   std::mutex mMutex;
@@ -795,6 +865,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   // e.g. 16 nvfp4 elements are packed into a single int64 element
   int64_t mInnerDimMultiplier;
   Tensor mProfileWorkspace;
+  Tensor mRunWorkspace;
+  size_t mRunWorkspaceSize{0};
+  int mRunWorkspaceDeviceId{-1};
 
   bool mUseDeepSeekFP8BlockScaling = false;
   bool mUseW4GroupScaling = false;
@@ -805,6 +878,178 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   std::vector<Profile> mAllProfiles;
   int64_t mGemm1TacticCount{0};
   int64_t mGemm2TacticCount{0};
+
+  static bool hasAnyLoraArg(Optional<TensorView> token_lora_indices,
+                            Optional<TensorView> fc1_lora_ranks,
+                            Optional<TensorView> fc1_lora_weight_ptrs,
+                            Optional<TensorView> fc2_lora_ranks,
+                            Optional<TensorView> fc2_lora_weight_ptrs,
+                            Optional<TensorView> gated_lora_ranks,
+                            Optional<TensorView> gated_lora_weight_ptrs) {
+    return token_lora_indices.has_value() || fc1_lora_ranks.has_value() ||
+           fc1_lora_weight_ptrs.has_value() || fc2_lora_ranks.has_value() ||
+           fc2_lora_weight_ptrs.has_value() || gated_lora_ranks.has_value() ||
+           gated_lora_weight_ptrs.has_value();
+  }
+
+  static size_t loraAlign16(size_t value) { return ((value + 15) / 16) * 16; }
+
+  static size_t loraMetadataWorkspaceSize(int64_t expanded_num_rows, int64_t num_rows,
+                                          int num_experts_on_rank, int num_lora_adapters,
+                                          int num_lora_modules,
+                                          bool needs_fc1_no_adapter_row_list) {
+    size_t const rank_size = loraAlign16(static_cast<size_t>(expanded_num_rows) * sizeof(int32_t));
+    size_t const ptr_size =
+        loraAlign16(static_cast<size_t>(expanded_num_rows) * 2 * sizeof(void const*));
+    size_t const adapter_index_size =
+        loraAlign16(static_cast<size_t>(expanded_num_rows) * sizeof(int32_t));
+    size_t const adapter_expert_bucket_count =
+        static_cast<size_t>(num_lora_adapters) * static_cast<size_t>(num_experts_on_rank);
+    size_t const adapter_expert_row_counts_size =
+        loraAlign16(adapter_expert_bucket_count * sizeof(int32_t));
+    size_t const adapter_expert_row_starts_size =
+        loraAlign16(adapter_expert_bucket_count * sizeof(int32_t));
+    size_t const adapter_expert_row_indices_size =
+        loraAlign16(adapter_expert_bucket_count * static_cast<size_t>(num_rows) * sizeof(int32_t));
+    size_t const no_adapter_expert_row_counts_size =
+        needs_fc1_no_adapter_row_list
+            ? loraAlign16(static_cast<size_t>(num_experts_on_rank) * sizeof(int32_t))
+            : 0;
+    size_t const no_adapter_expert_row_starts_size =
+        needs_fc1_no_adapter_row_list
+            ? loraAlign16(static_cast<size_t>(num_experts_on_rank) * sizeof(int32_t))
+            : 0;
+    size_t const no_adapter_expert_row_indices_size =
+        needs_fc1_no_adapter_row_list ? loraAlign16(static_cast<size_t>(num_experts_on_rank) *
+                                                    static_cast<size_t>(num_rows) * sizeof(int32_t))
+                                      : 0;
+    size_t const fc1_gated_lora_has_missing_rows_size =
+        needs_fc1_no_adapter_row_list ? loraAlign16(sizeof(int32_t)) : 0;
+    return adapter_index_size + static_cast<size_t>(num_lora_modules) * (rank_size + ptr_size) +
+           adapter_expert_row_counts_size + adapter_expert_row_starts_size +
+           adapter_expert_row_indices_size + no_adapter_expert_row_counts_size +
+           no_adapter_expert_row_starts_size + no_adapter_expert_row_indices_size +
+           fc1_gated_lora_has_missing_rows_size;
+  }
+
+  static void checkPointerTensor(TensorView tensor, int64_t expected_size, char const* name) {
+    CHECK_INPUT(tensor);
+    CHECK_CONTIGUOUS(tensor);
+    CHECK_DIM(1, tensor);
+    TVM_FFI_ICHECK(tensor.dtype() == dl_int64 || tensor.dtype() == dl_uint64)
+        << name << " must be an int64/uint64 CUDA tensor containing device pointers";
+    TVM_FFI_ICHECK_EQ(tensor.size(0), expected_size) << name << " has unexpected number of entries";
+  }
+
+  static void checkRankTensor(TensorView tensor, int64_t expected_size, char const* name) {
+    CHECK_INPUT(tensor);
+    CHECK_CONTIGUOUS(tensor);
+    CHECK_DIM(1, tensor);
+    CHECK_INPUT_TYPE(tensor, dl_int32);
+    TVM_FFI_ICHECK_EQ(tensor.size(0), expected_size) << name << " has unexpected number of entries";
+  }
+
+  LoraInfo prepareLoraInfo(int64_t num_rows, int experts_per_token, int64_t hidden_size,
+                           int64_t inter_size, int64_t num_experts_on_rank,
+                           ActivationType activation_type, Optional<TensorView> token_lora_indices,
+                           Optional<TensorView> fc1_lora_ranks,
+                           Optional<TensorView> fc1_lora_weight_ptrs,
+                           Optional<TensorView> fc2_lora_ranks,
+                           Optional<TensorView> fc2_lora_weight_ptrs,
+                           Optional<TensorView> gated_lora_ranks,
+                           Optional<TensorView> gated_lora_weight_ptrs, int64_t lora_max_rank) {
+    LoraInfo info{};
+    bool const has_lora =
+        hasAnyLoraArg(token_lora_indices, fc1_lora_ranks, fc1_lora_weight_ptrs, fc2_lora_ranks,
+                      fc2_lora_weight_ptrs, gated_lora_ranks, gated_lora_weight_ptrs);
+    if (!has_lora) {
+      return info;
+    }
+
+    TVM_FFI_ICHECK(token_lora_indices.has_value() && fc1_lora_ranks.has_value() &&
+                   fc1_lora_weight_ptrs.has_value() && fc2_lora_ranks.has_value() &&
+                   fc2_lora_weight_ptrs.has_value())
+        << "LoRA requires token_lora_indices, fc1/fc2 rank tensors, and fc1/fc2 pointer tensors";
+
+    bool const is_gated = isGatedActivation(activation_type);
+    TVM_FFI_ICHECK(!is_gated ||
+                   (gated_lora_ranks.has_value() && gated_lora_weight_ptrs.has_value()))
+        << "Gated MoE LoRA requires gated_lora_ranks and gated_lora_weight_ptrs";
+
+    CHECK_INPUT(token_lora_indices.value());
+    CHECK_CONTIGUOUS(token_lora_indices.value());
+    CHECK_DIM(1, token_lora_indices.value());
+    TVM_FFI_ICHECK(token_lora_indices.value().dtype() == dl_int32 ||
+                   token_lora_indices.value().dtype() == dl_int64)
+        << "token_lora_indices must be int32 or int64";
+    TVM_FFI_ICHECK_EQ(token_lora_indices.value().size(0), num_rows)
+        << "token_lora_indices must have one entry per input token";
+
+    CHECK_INPUT(fc1_lora_ranks.value());
+    CHECK_CONTIGUOUS(fc1_lora_ranks.value());
+    CHECK_DIM(1, fc1_lora_ranks.value());
+    CHECK_INPUT_TYPE(fc1_lora_ranks.value(), dl_int32);
+    int64_t const num_lora_adapters = fc1_lora_ranks.value().size(0);
+    TVM_FFI_ICHECK_GT(num_lora_adapters, 0) << "LoRA rank tensors must not be empty";
+    checkRankTensor(fc2_lora_ranks.value(), num_lora_adapters, "fc2_lora_ranks");
+    checkPointerTensor(fc1_lora_weight_ptrs.value(), num_lora_adapters * 2, "fc1_lora_weight_ptrs");
+    checkPointerTensor(fc2_lora_weight_ptrs.value(), num_lora_adapters * 2, "fc2_lora_weight_ptrs");
+    int64_t const max_low_rank = lora_max_rank;
+    if (is_gated) {
+      checkRankTensor(gated_lora_ranks.value(), num_lora_adapters, "gated_lora_ranks");
+      checkPointerTensor(gated_lora_weight_ptrs.value(), num_lora_adapters * 2,
+                         "gated_lora_weight_ptrs");
+    }
+
+    TVM_FFI_ICHECK_GT(max_low_rank, 0)
+        << "LoRA requires a positive lora_max_rank with device metadata";
+
+    auto lora_dtype = DtypeUtils::dataType(mOutputDtype);
+    TVM_FFI_ICHECK(lora_dtype == nvinfer1::DataType::kHALF ||
+                   lora_dtype == nvinfer1::DataType::kBF16 ||
+                   lora_dtype == nvinfer1::DataType::kFLOAT)
+        << "CUTLASS MoE LoRA only supports fp16, bf16, or fp32 LoRA weights";
+
+    std::vector<int> fc1_out_sizes{static_cast<int>(inter_size)};
+    std::vector<int> fc1_gated_out_sizes{static_cast<int>(inter_size),
+                                         static_cast<int>(inter_size)};
+    std::vector<int> fc2_out_sizes{static_cast<int>(hidden_size)};
+    info.fc1_lora_impl = std::make_shared<::tensorrt_llm::kernels::LoraImpl>(
+        static_cast<int>(hidden_size), fc1_out_sizes, false, true, 1, lora_dtype,
+        static_cast<int>(max_low_rank), nullptr);
+    if (is_gated) {
+      info.fc1_gated_lora_impl = std::make_shared<::tensorrt_llm::kernels::LoraImpl>(
+          static_cast<int>(hidden_size), fc1_gated_out_sizes, false, true, 2, lora_dtype,
+          static_cast<int>(max_low_rank), nullptr);
+    }
+    info.fc2_lora_impl = std::make_shared<::tensorrt_llm::kernels::LoraImpl>(
+        static_cast<int>(inter_size), fc2_out_sizes, false, true, 1, lora_dtype,
+        static_cast<int>(max_low_rank), nullptr);
+
+    int64_t const expanded_num_rows = num_rows * experts_per_token;
+    int64_t const num_reqs_lora =
+        std::min<int64_t>(expanded_num_rows, num_rows * num_experts_on_rank);
+    int const num_lora_modules = is_gated ? 3 : 2;
+    bool const needs_fc1_no_adapter_row_list = is_gated && max_low_rank == 16 &&
+                                               expanded_num_rows >= 1024 && (inter_size % 2 == 0);
+    size_t const metadata_workspace_size = loraMetadataWorkspaceSize(
+        expanded_num_rows, num_rows, num_experts_on_rank, num_lora_adapters, num_lora_modules,
+        needs_fc1_no_adapter_row_list);
+    size_t device_run_workspace_size = std::max(
+        info.fc1_lora_impl->getDeviceWorkspaceSize(expanded_num_rows, num_reqs_lora, lora_dtype),
+        info.fc2_lora_impl->getDeviceWorkspaceSize(expanded_num_rows, num_reqs_lora, lora_dtype));
+    if (info.fc1_gated_lora_impl) {
+      device_run_workspace_size =
+          std::max(device_run_workspace_size, info.fc1_gated_lora_impl->getDeviceWorkspaceSize(
+                                                  expanded_num_rows, num_reqs_lora, lora_dtype));
+    }
+    info.run_workspace_offset = metadata_workspace_size;
+    info.workspace_size = metadata_workspace_size + device_run_workspace_size;
+    info.use_lora = true;
+    info.max_low_rank = max_low_rank;
+    info.num_lora_adapters = num_lora_adapters;
+    return info;
+  }
 
   void setRunnerProfiles(Optional<Array<int64_t>> profile_ids) {
     if (mUseDeepSeekFP8BlockScaling) {
@@ -833,12 +1078,13 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         best_gemm1_profile = mAllProfiles.at(id1);
       }
 
-      // GEMM2 index: support both absolute (combined) and relative (within GEMM2 subrange) ids
+      // GEMM2 autotuning returns absolute ids from the combined tactic list.
+      // Older callers may still pass relative GEMM2 ids, so only offset ids
+      // that are below the GEMM2 absolute range.
       auto id2 = profile_ids.value()[1];
       if (id2 != -1) {
         int64_t absolute_id2 = id2;
-        // If id2 appears relative to GEMM2 subrange, offset it
-        if (id2 >= 0 && id2 < mGemm2TacticCount) {
+        if (id2 >= 0 && id2 < mGemm1TacticCount) {
           absolute_id2 = mGemm1TacticCount + id2;
         }
         TVM_FFI_ICHECK(absolute_id2 >= 0 &&
@@ -854,14 +1100,14 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                                  int num_experts, int experts_per_token,
                                  ActivationType activation_type,
                                  kernels::MOEParallelismConfig parallelismConfig,
-                                 bool min_latency_mode) {
+                                 bool min_latency_mode, bool use_lora, size_t lora_workspace_size) {
     size_t moe_workspace_size = mKernelRunner->getWorkspaceSize(
         num_rows, hidden_size, inter_size, num_experts, experts_per_token, activation_type,
-        parallelismConfig, /* use_lora */ false, mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling,
+        parallelismConfig, use_lora, mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling,
         min_latency_mode, mUseW4GroupScaling);
     size_t src_to_dest_map_size = experts_per_token * num_rows * sizeof(int);
 
-    std::vector<size_t> workspaces{moe_workspace_size, src_to_dest_map_size};
+    std::vector<size_t> workspaces{moe_workspace_size, src_to_dest_map_size, lora_workspace_size};
 
     size_t total_workspace_size =
         common::calculateTotalWorkspaceSize(workspaces.data(), workspaces.size());
@@ -869,10 +1115,18 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     WorkspaceInfo info{};
     int device_id;
     cudaGetDevice(&device_id);
-    info.workspace = alloc_tensor({static_cast<int64_t>(total_workspace_size)}, dl_int8,
-                                  DLDevice{kDLCUDA, device_id});
+    size_t const alloc_size = total_workspace_size == 0 ? 1 : total_workspace_size;
+    if (mRunWorkspaceSize < alloc_size || mRunWorkspaceDeviceId != device_id) {
+      mRunWorkspace =
+          alloc_tensor({static_cast<int64_t>(alloc_size)}, dl_int8, DLDevice{kDLCUDA, device_id});
+      mRunWorkspaceSize = alloc_size;
+      mRunWorkspaceDeviceId = device_id;
+    }
+    info.workspace = mRunWorkspace;
     info.src_to_dest_map = common::nextWorkspacePtr(static_cast<int8_t*>(info.workspace.data_ptr()),
                                                     moe_workspace_size);
+    info.lora_workspace =
+        common::nextWorkspacePtr(static_cast<int8_t*>(info.src_to_dest_map), src_to_dest_map_size);
 
     return info;
   }

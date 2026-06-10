@@ -49,6 +49,7 @@
 #include <cuda_fp16.h>
 #include <math.h>
 
+#include <cstdlib>
 #include <mutex>
 #include <sstream>
 
@@ -63,6 +64,35 @@
 namespace tensorrt_llm::kernels::cutlass_kernels_oss {
 using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
 using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
+
+namespace {
+
+inline bool shouldUseSm90Bf16Pingpong(cutlass_extensions::CutlassGemmConfig const& gemm_config) {
+  char const* value = std::getenv("FLASHINFER_CUTLASS_MOE_SM90_BF16_PINGPONG");
+  if (value == nullptr || *value == '\0' || *value == '0') {
+    return false;
+  }
+  if (gemm_config.sm_version != 90 ||
+      gemm_config.tile_config_sm90 !=
+          cutlass_extensions::CutlassTileConfigSM90::CtaShape128x64x128B ||
+      gemm_config.epilogue_fusion_type !=
+          cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::NONE ||
+      !gemm_config.swap_ab) {
+    return false;
+  }
+
+  bool const is_cluster_1x1 =
+      gemm_config.cluster_shape == cutlass_extensions::ClusterShape::ClusterShape_1x1x1;
+  bool const is_cluster_2x1 =
+      gemm_config.cluster_shape == cutlass_extensions::ClusterShape::ClusterShape_2x1x1;
+  if (!is_cluster_1x1 && !is_cluster_2x1) {
+    return false;
+  }
+
+  return true;
+}
+
+}  // namespace
 
 template <typename Arch, typename T, typename WeightType, typename OutputType, typename EpilogueTag,
           EpilogueFusion FUSION, typename TileShape, typename ClusterShape, bool IsMXFPX>
@@ -191,15 +221,6 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(
         auto cluster_shape_cute_fallback = cute::Shape<int32_t, int32_t, cute::_1>{
             std::get<0>(cluster_shape_fallback), std::get<1>(cluster_shape_fallback), cute::_1{}};
 
-        // HACK debug the gemm_config used to produce selected_func
-        // std::cout << "[SM100 gemm_config] sm_version=" << gemm_config.sm_version
-        //           << ", tile_config_sm100=" << static_cast<int>(gemm_config.tile_config_sm100)
-        //           << ", epilogue_schedule=" << static_cast<int>(gemm_config.epilogue_schedule)
-        //           << ", dynamic_cluster_shape=" <<
-        //           static_cast<int>(gemm_config.dynamic_cluster_shape)
-        //           << ", fallback_cluster_shape="
-        // << static_cast<int>(gemm_config.fallback_cluster_shape) << std::endl;
-
         auto selected_func =
             getDispatchFunctionForSM100<Arch, T, WeightType, OutputType, EpilogueTag, FUSION,
                                         TileShape, ClusterShape, IsMXFPX>(
@@ -208,6 +229,23 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(
                       workspace_size, cluster_shape_cute, cluster_shape_cute_fallback);
       } else if constexpr (Arch::kMinComputeCapability >= 120 ||
                            Arch::kMinComputeCapability == 90) {
+        constexpr bool can_use_sm90_bf16_pingpong =
+            Arch::kMinComputeCapability == 90 && FUSION == EpilogueFusion::NONE && !IsMXFPX &&
+            std::is_same_v<T, __nv_bfloat16> && std::is_same_v<WeightType, __nv_bfloat16> &&
+            std::is_same_v<OutputType, __nv_bfloat16>;
+        if constexpr (can_use_sm90_bf16_pingpong) {
+          if (shouldUseSm90Bf16Pingpong(gemm_config)) {
+            using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong;
+            constexpr bool dynamic_cga = false;
+            auto selected_func =
+                kernels::cutlass_kernels_oss::tma_warp_specialized_generic_moe_gemm_kernelLauncher<
+                    Arch, T, WeightType, OutputType, EpilogueSchedule, EpilogueTag, FUSION,
+                    TileShape, ClusterShape, IsMXFPX, dynamic_cga, false, true>;
+            selected_func(hopper_input, num_experts, multi_processor_count, stream, occupancy,
+                          workspace_size, {}, {});
+            return;
+          }
+        }
         using EpilogueSchedule = void;  // These are hardcoded in the launcher
         constexpr bool dynamic_cga = false;
         auto selected_func =

@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include <cassert>
+#include <memory>
 #include <vector>
 
 #include "tensorrt_llm/common/NvInferRuntime.h"
@@ -26,47 +26,60 @@
 namespace tensorrt_llm::kernels {
 
 using CublasGemmWrapper = tensorrt_llm::common::CublasMMWrapper;
-using CublasGemmWrapperPtr = std::shared_ptr<CublasGemmWrapper>;
-using Config = cublasLtMatmulHeuristicResult_t;
 
 class LoraImpl {
  public:
+  // max_low_rank is the padded storage rank used for A/B strides and workspace size.
   LoraImpl(int in_hidden_size, std::vector<int> out_hidden_sizes, bool transA, bool transB,
            int num_lora_modules, nvinfer1::DataType type, int max_low_rank,
            std::shared_ptr<CublasGemmWrapper> cublasWrapper);
 
   [[nodiscard]] size_t getWorkspaceSize(int64_t numTokens, int64_t numReqs,
                                         nvinfer1::DataType type) const noexcept;
-  void setBestTactic(std::optional<Config> config);
+  [[nodiscard]] size_t getDeviceWorkspaceSize(int64_t numTokens, int64_t numReqs,
+                                              nvinfer1::DataType type) const noexcept;
+  // loraRanks are math ranks. Weight storage is padded to the constructor max_low_rank.
   int run(int64_t numTokens, int64_t numReqs, void const* input, int32_t const* loraRanks,
           void const* const* loraWeightsPtr, int weightIndex, void* const* outputs, void* workspace,
           cudaStream_t stream);
-
-  void setGemmConfig();
-
-  [[nodiscard]] CublasGemmWrapperPtr getCublasWrapper() const { return mCublasWrapper; }
+  int runDevice(int64_t numTokens, int64_t numReqs, void const* input, int32_t const* loraRanks,
+                void const* const* loraWeightsPtr, int weightIndex, void* const* outputs,
+                void* workspace, cudaStream_t stream);
+  int runDeviceLowRank(int64_t numTokens, int64_t numReqs, void const* input,
+                       int32_t const* loraRanks, void const* const* loraWeightsPtr,
+                       int weightIndex, void* workspace, cudaStream_t stream);
+  int runDeviceStridedOutputs(int64_t numTokens, int64_t numReqs, void const* input,
+                              int32_t const* loraRanks, void const* const* loraWeightsPtr,
+                              int weightIndex, void* const* outputs,
+                              int64_t const* outputStrides, void* workspace,
+                              cudaStream_t stream);
 
  private:
-  bool mTransA;
-  bool mTransB;
   nvinfer1::DataType mType;
   int mNumLoraModules;
-
-  // @fixme: seems this is shared across multiple clones.
-  // If we deep copy the wrapper inside clone(), then we may avoid the mutex inside the wrapper?
-  CublasGemmWrapperPtr mCublasWrapper;
 
   int mInHiddenSize;
   std::vector<int> mOutHiddenSizes;
   int mMaxLowRank;
-  static int constexpr mSplitKSlices = 16;
-
-  std::optional<Config> mBestConfig;
 };
 
 // Change to following declarations must sync with moe_kernels.h in internal kernel repo
 int Lora_run(LoraImpl* impl, int64_t numTokens, int64_t numReqs, void const* input,
              int32_t const* loraRanks, void const* const* loraWeightsPtr, int weightIndex,
              void* const* outputs, void* workspace, cudaStream_t stream);
+
+int Lora_run_device(LoraImpl* impl, int64_t numTokens, int64_t numReqs, void const* input,
+                    int32_t const* loraRanks, void const* const* loraWeightsPtr, int weightIndex,
+                    void* const* outputs, void* workspace, cudaStream_t stream);
+
+int Lora_run_device_low_rank(LoraImpl* impl, int64_t numTokens, int64_t numReqs,
+                             void const* input, int32_t const* loraRanks,
+                             void const* const* loraWeightsPtr, int weightIndex,
+                             void* workspace, cudaStream_t stream);
+
+int Lora_run_device_strided_outputs(
+    LoraImpl* impl, int64_t numTokens, int64_t numReqs, void const* input,
+    int32_t const* loraRanks, void const* const* loraWeightsPtr, int weightIndex,
+    void* const* outputs, int64_t const* outputStrides, void* workspace, cudaStream_t stream);
 
 }  // namespace tensorrt_llm::kernels

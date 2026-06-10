@@ -28,12 +28,22 @@ template <class ArchTag, class TileShape, class ClusterShape, bool DYNAMIC_CGA,
           class ActivationType>
 struct should_filter_tma_warp_specialized_gemm_problem_shape {
 #ifdef FAST_BUILD
-  using SupportedCtaShape =
+  using SupportedCtaShape128 =
       cute::Shape<cute::_128, cute::_128, decltype(cute::get<2>(TileShape{}))>;
-  using SupportedCgaShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+  using SupportedCtaShape256 =
+      cute::Shape<cute::_256, cute::_128, decltype(cute::get<2>(TileShape{}))>;
+  using SupportedCgaShape1x1 = cute::Shape<cute::_1, cute::_1, cute::_1>;
+  using SupportedCgaShape1x2 = cute::Shape<cute::_1, cute::_2, cute::_1>;
+  using SupportedCgaShape2x1 = cute::Shape<cute::_2, cute::_1, cute::_1>;
+  using SupportedCgaShape2x2 = cute::Shape<cute::_2, cute::_2, cute::_1>;
 
-  constexpr static bool value = !cute::is_same_v<SupportedCtaShape, TileShape> ||
-                                !cute::is_same_v<SupportedCgaShape, ClusterShape> || DYNAMIC_CGA;
+  constexpr static bool value = !(cute::is_same_v<SupportedCtaShape128, TileShape> ||
+                                  cute::is_same_v<SupportedCtaShape256, TileShape>) ||
+                                !(cute::is_same_v<SupportedCgaShape1x1, ClusterShape> ||
+                                  cute::is_same_v<SupportedCgaShape1x2, ClusterShape> ||
+                                  cute::is_same_v<SupportedCgaShape2x1, ClusterShape> ||
+                                  cute::is_same_v<SupportedCgaShape2x2, ClusterShape>) ||
+                                DYNAMIC_CGA;
 #else
   constexpr static bool value = false;
 #endif
