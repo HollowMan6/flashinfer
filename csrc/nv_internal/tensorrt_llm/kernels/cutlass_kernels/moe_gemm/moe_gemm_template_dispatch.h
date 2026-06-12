@@ -535,15 +535,15 @@ namespace tensorrt_llm::kernels::cutlass_kernels {
 
 namespace {
 
-inline int getEnvSmCount(char const* name, int physical_sm_count) {
+inline int getEnvSmCount(char const* name, int default_sm_count, int physical_sm_count) {
   char const* value = std::getenv(name);
   if (value == nullptr || *value == '\0') {
-    return physical_sm_count;
+    return default_sm_count;
   }
   char* end = nullptr;
   long const parsed = std::strtol(value, &end, 10);
   if (end == value || parsed <= 0) {
-    return physical_sm_count;
+    return default_sm_count;
   }
   return static_cast<int>(std::min<long>(parsed, physical_sm_count));
 }
@@ -551,10 +551,12 @@ inline int getEnvSmCount(char const* name, int physical_sm_count) {
 inline int getTmaWarpSpecializedSmCount(int64_t n, int64_t k, int physical_sm_count) {
   int sm_count = physical_sm_count;
   if (n == 6144 && k == 2048) {
-    if (physical_sm_count >= 76) {
+    if (physical_sm_count <= 80 && physical_sm_count >= 74) {
+      sm_count = 74;
+    } else if (physical_sm_count >= 76) {
       sm_count = std::min(sm_count, 76);
     }
-    sm_count = getEnvSmCount("FLASHINFER_CUTLASS_MOE_TMA_GEMM2_SMS", sm_count);
+    sm_count = getEnvSmCount("FLASHINFER_CUTLASS_MOE_TMA_GEMM2_SMS", sm_count, physical_sm_count);
   }
   return sm_count;
 }

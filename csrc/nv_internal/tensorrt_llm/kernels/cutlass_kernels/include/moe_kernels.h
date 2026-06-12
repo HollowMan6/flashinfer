@@ -734,10 +734,10 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
       int64_t const inter_size, int const num_experts_per_node,
       ActivationParams fc1_activation_type, float const** alpha_scale_ptr_array,
       bool bias_is_broadcast, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config,
-      bool min_latency_mode, int* num_active_experts_per, int* active_expert_global_ids,
-      bool enable_pdl, cudaEvent_t pre_activation_event = nullptr,
-      int32_t const* fc1_lora_bias_ranks = nullptr,
-      std::function<void()> const* pre_activation_work = nullptr);
+	      bool min_latency_mode, int* num_active_experts_per, int* active_expert_global_ids,
+	      bool enable_pdl, cudaEvent_t pre_activation_event = nullptr,
+	      int32_t const* fc1_lora_bias_ranks = nullptr,
+	      std::function<void()> const* pre_activation_work = nullptr);
 
   static void gemm2(
       MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>& gemm_runner,
@@ -965,13 +965,13 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                           int num_experts_per_node, bool needs_num_valid, LoraParams& lora_params,
                           bool use_grouped_lora_metadata_fast_path, cudaStream_t stream);
 
-  ScaleBiasType const* loraFC1(int64_t expanded_num_rows, int64_t inter_size, int64_t hidden_size,
-                               int num_experts_per_node, int start_expert,
-                               int64_t const* num_valid_tokens_ptr, bool is_gated_activation,
-                               ScaleBiasType const* fc1_expert_biases, LoraParams& lora_params,
-                               float const* input_fp8_dequant,
-                               InputType const* original_input_activations, int64_t num_rows,
-                               cudaStream_t stream);
+	  ScaleBiasType const* loraFC1(int64_t expanded_num_rows, int64_t inter_size, int64_t hidden_size,
+	                               int num_experts_per_node, int start_expert,
+	                               int64_t const* num_valid_tokens_ptr, bool is_gated_activation,
+	                               ScaleBiasType const* fc1_expert_biases, LoraParams& lora_params,
+	                               float const* input_fp8_dequant,
+	                               InputType const* original_input_activations, int64_t num_rows,
+	                               cudaStream_t stream);
 
   void loraFC2(int64_t inter_size, int64_t hidden_size, int num_experts_per_node, int start_expert,
                int64_t const* num_valid_tokens_ptr, int64_t num_tokens, LoraParams& lora_params,

@@ -21,6 +21,7 @@
 #include <mma.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <numeric>
@@ -3029,9 +3030,9 @@ bool maybeLaunchFinalizeMoeRoutingWithTokenLoraFastPath(
     auto const* lora = reinterpret_cast<__nv_bfloat16 const*>(expanded_lora_rows);
     auto* output = reinterpret_cast<__nv_bfloat16*>(reduced_unpermuted_output);
     launchFinalizeMoeRoutingWithTokenLoraBf16Top8<TokenIndexT, 256, 8, false>(
-        base, lora, output, final_scales, unpermuted_row_to_permuted_row, token_selected_experts,
-        token_lora_indices, adapter_lora_ranks, adapter_lora_weight_ptrs, num_rows,
-        num_lora_adapters, enable_pdl, stream);
+        base, lora, output, final_scales, unpermuted_row_to_permuted_row,
+        token_selected_experts, token_lora_indices, adapter_lora_ranks, adapter_lora_weight_ptrs,
+        num_rows, num_lora_adapters, enable_pdl, stream);
     return true;
   }
   return false;
@@ -3606,8 +3607,8 @@ __global__ __launch_bounds__(kThreadsPerBlock) void doActivationSwigluBf16Kernel
         gate_value.y += gate_bias.y;
       }
 
-      float const act0 = gate_value.x / (1.0f + expf(-gate_value.x));
-      float const act1 = gate_value.y / (1.0f + expf(-gate_value.y));
+      float const act0 = gate_value.x / (1.0f + __expf(-gate_value.x));
+      float const act1 = gate_value.y / (1.0f + __expf(-gate_value.y));
       output_pairs[pair_idx] = __floats2bfloat162_rn(act0 * linear_value.x, act1 * linear_value.y);
     }
   }
@@ -4485,9 +4486,6 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
       (*pre_activation_work)();
     }
     sync_check_cuda_error(stream);
-    if (pre_activation_event != nullptr) {
-      check_cuda_error(cudaStreamWaitEvent(stream, pre_activation_event, 0));
-    }
 
     // TODO: when bias_is_broadcast is false, fuse bias to gemm
     using GatedActOutputType = std::conditional_t<use_w4afp8, BackBoneType, T>;
@@ -4496,6 +4494,10 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
                                         ? quant_params.fp8_mxfp4.fc2.use_per_expert_act_scale
                                     : use_fp8 ? quant_params.fp8.fc2_use_per_expert_act_scale
                                               : false;
+
+    if (pre_activation_event != nullptr) {
+      check_cuda_error(cudaStreamWaitEvent(stream, pre_activation_event, 0));
+    }
 
     doActivation<GatedActOutputType, UnfusedGemmOutputType>(
         reinterpret_cast<GatedActOutputType*>(output),
@@ -5247,6 +5249,16 @@ inline void loraLowRank16Bf16TensorCoreGrouped(
              (num_experts_per_node * (num_lora_adapters + 1)));
   int max_row_blocks_per_bucket = static_cast<int>(std::min<int64_t>(
       64, std::max<int64_t>(1, (avg_rows_per_adapter + rows_per_block - 1) / rows_per_block)));
+  if (input_hidden_size == 2048 && expanded_num_rows >= 262144 && num_experts_per_node == 256 &&
+      num_lora_adapters <= 4 && num_lora_modules == 1) {
+    max_row_blocks_per_bucket = 96;
+  }
+  if (char const* raw = std::getenv("FLASHINFER_CUTLASS_MOE_LORA_LOW_RANK_ROW_BLOCKS")) {
+    int const requested = std::atoi(raw);
+    if (requested > 0) {
+      max_row_blocks_per_bucket = std::min(128, requested);
+    }
+  }
   dim3 const grid(static_cast<unsigned int>(max_row_blocks_per_bucket),
                   static_cast<unsigned int>(num_lora_adapters),
                   static_cast<unsigned int>(num_lora_modules * num_experts_per_node));
@@ -5305,6 +5317,8 @@ __global__ void loraLowRank16Bf16TensorCoreGroupedDualKernel(
   if (use1) {
     lora_a_base1 += static_cast<size_t>(expert) * static_cast<size_t>(lora_a_expert_stride);
   }
+  bool const shared_lora_a =
+      use0 && use1 && lora_rank0 == lora_rank1 && lora_a_base0 == lora_a_base1;
   bool const use_direct_b =
       (!force_shared_lora_a) && (!use0 || full_rank0) && (!use1 || full_rank1);
   __shared__ __nv_bfloat16 a_smem[kWarpsPerBlock][16 * 16];
@@ -5350,7 +5364,7 @@ __global__ void loraLowRank16Bf16TensorCoreGroupedDualKernel(
           wmma::load_matrix_sync(b_frag0, lora_a_base0 + k, static_cast<int>(input_hidden_size));
           wmma::mma_sync(c_frag0, a_frag, b_frag0, c_frag0);
         }
-        if (use1) {
+        if (use1 && !shared_lora_a) {
           wmma::load_matrix_sync(b_frag1, lora_a_base1 + k, static_cast<int>(input_hidden_size));
           wmma::mma_sync(c_frag1, a_frag, b_frag1, c_frag1);
         }
@@ -5370,7 +5384,7 @@ __global__ void loraLowRank16Bf16TensorCoreGroupedDualKernel(
                       : __float2bfloat16(0.0f);
             }
           }
-          if (use1) {
+          if (use1 && !shared_lora_a) {
             if (full_rank1) {
               b_smem1[stage][idx] =
                   lora_a_base1[k + local_k + static_cast<int64_t>(rank) * input_hidden_size];
@@ -5402,7 +5416,7 @@ __global__ void loraLowRank16Bf16TensorCoreGroupedDualKernel(
           wmma::load_matrix_sync(b_frag0, b_smem0[stage], 16);
           wmma::mma_sync(c_frag0, a_frag, b_frag0, c_frag0);
         }
-        if (use1) {
+        if (use1 && !shared_lora_a) {
           wmma::load_matrix_sync(b_frag1, b_smem1[stage], 16);
           wmma::mma_sync(c_frag1, a_frag, b_frag1, c_frag1);
         }
@@ -5412,7 +5426,7 @@ __global__ void loraLowRank16Bf16TensorCoreGroupedDualKernel(
     if (use0) {
       wmma::store_matrix_sync(c_smem0[warp_id], c_frag0, 16, wmma::mem_row_major);
     }
-    if (use1) {
+    if (use1 && !shared_lora_a) {
       wmma::store_matrix_sync(c_smem1[warp_id], c_frag1, 16, wmma::mem_row_major);
     }
     __syncwarp();
@@ -5430,7 +5444,8 @@ __global__ void loraLowRank16Bf16TensorCoreGroupedDualKernel(
       if (use1) {
         low_rank_workspace1[out_offset] =
             (full_rank1 || rank < lora_rank1)
-                ? __float2bfloat16(c_smem1[warp_id][local_row * 16 + rank])
+                ? __float2bfloat16((shared_lora_a ? c_smem0 : c_smem1)[warp_id]
+                                                               [local_row * 16 + rank])
                 : __float2bfloat16(0.0f);
       }
     }
@@ -5452,8 +5467,19 @@ inline void loraLowRank16Bf16TensorCoreGroupedDual(
   int64_t const avg_rows_per_adapter = std::max<int64_t>(
       1, (expanded_num_rows + num_experts_per_node * (num_lora_adapters + 1) - 1) /
              (num_experts_per_node * (num_lora_adapters + 1)));
-  int const max_row_blocks_per_bucket = static_cast<int>(std::min<int64_t>(
+  int max_row_blocks_per_bucket = static_cast<int>(std::min<int64_t>(
       64, std::max<int64_t>(1, (avg_rows_per_adapter + rows_per_block - 1) / rows_per_block)));
+  if (input_hidden_size == 6144 && expanded_num_rows >= 262144 && num_experts_per_node == 256 &&
+      num_lora_adapters <= 4) {
+    max_row_blocks_per_bucket = 96;
+  }
+  if (char const* raw =
+          std::getenv("FLASHINFER_CUTLASS_MOE_LORA_DUAL_LOW_RANK_ROW_BLOCKS")) {
+    int const requested = std::atoi(raw);
+    if (requested > 0) {
+      max_row_blocks_per_bucket = std::min(128, requested);
+    }
+  }
   dim3 const grid(static_cast<unsigned int>(max_row_blocks_per_bucket),
                   static_cast<unsigned int>(num_lora_adapters),
                   static_cast<unsigned int>(num_experts_per_node));
@@ -5481,12 +5507,16 @@ __global__ void loraOutput16Bf16TensorCoreGroupedKernel(
     int64_t output_stride, int num_lora_adapters, int num_experts_per_node,
     int32_t const* adapter_lora_ranks, void const* const* adapter_lora_weight_ptrs,
     int32_t const* adapter_expert_row_counts, int32_t const* adapter_expert_row_starts,
-    int n_tile_start, int n_tile_end) {
+    int n_tile_start, int n_tile_end, int row_split_groups, int row_split_rows) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
   int const warp_id = threadIdx.x >> 5;
   int const lane = threadIdx.x & 31;
+  int const row_group_count = max(1, row_split_groups);
+  int const linear_tile_group = static_cast<int>(blockIdx.x);
+  int const n_tile_group = linear_tile_group / row_group_count;
+  int const row_group = linear_tile_group - n_tile_group * row_group_count;
   int const n_tile_base =
-      n_tile_start + (static_cast<int>(blockIdx.x) * kWarpsPerBlock + warp_id) * kNTilesPerWarp;
+      n_tile_start + (n_tile_group * kWarpsPerBlock + warp_id) * kNTilesPerWarp;
   int const adapter = static_cast<int>(blockIdx.y);
   int const expert = static_cast<int>(blockIdx.z);
   int const out_tiles = static_cast<int>(out_hidden_size >> 4);
@@ -5530,65 +5560,74 @@ __global__ void loraOutput16Bf16TensorCoreGroupedKernel(
                              lora_b_base + static_cast<size_t>(n_tile) * 16 * 16, 16);
     }
   }
-  for (int tile_row = 0; tile_row < row_count; tile_row += 16) {
-    int const valid_rows = min(16, row_count - tile_row);
-    int64_t const row = static_cast<int64_t>(row_start) + tile_row;
-    for (int idx = threadIdx.x; idx < 16 * 16; idx += blockDim.x) {
-      int const local_row = idx >> 4;
-      int const rank = idx & 15;
-      bool const valid_row = local_row < valid_rows;
-      if (has_lora && full_rank) {
-        a_smem[idx] =
-            valid_row ? low_rank_workspace[(row + local_row) * 16 + rank] : __float2bfloat16(0.0f);
-      } else {
-        a_smem[idx] = (valid_row && rank < lora_rank)
-                          ? low_rank_workspace[(row + local_row) * 16 + rank]
-                          : __float2bfloat16(0.0f);
-      }
-    }
-    __syncthreads();
-
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
-    if (do_mma) {
-      wmma::load_matrix_sync(a_frag, a_smem, 16);
-    }
-    __syncthreads();
-
-#pragma unroll
-    for (int tile_offset = 0; tile_offset < kNTilesPerWarp; ++tile_offset) {
-      int const n_tile = n_tile_base + tile_offset;
-      bool const valid_n_tile = valid_n_tiles[tile_offset];
-      bool const has_valid_lora_tile = has_valid_lora_tiles[tile_offset];
-      if (has_valid_lora_tile) {
-        wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
-        wmma::fill_fragment(c_frag, 0.0f);
-        wmma::mma_sync(c_frag, a_frag, b_frags[tile_offset], c_frag);
-        wmma::store_matrix_sync(c_smem[warp_id], c_frag, 16, wmma::mem_row_major);
-      }
-      __syncwarp();
-      if (!valid_n_tile) {
-        continue;
-      }
-      for (int idx = lane; idx < valid_rows * 8; idx += 32) {
-        int const local_row = idx >> 3;
-        int const local_pair = idx & 7;
-        int const c_offset = local_row * 16 + local_pair * 2;
-        auto* out_pairs = reinterpret_cast<__nv_bfloat162*>(
-            output + (row + local_row) * output_stride + static_cast<int64_t>(n_tile) * 16);
-        if (has_valid_lora_tile) {
-          float value0 = c_smem[warp_id][c_offset];
-          float value1 = c_smem[warp_id][c_offset + 1];
-          if constexpr (AddToOutput) {
-            float2 prev = __bfloat1622float2(out_pairs[local_pair]);
-            value0 += prev.x;
-            value1 += prev.y;
-          }
-          out_pairs[local_pair] = __floats2bfloat162_rn(value0, value1);
+  int const row_span = row_split_rows > 0 ? row_split_rows : row_count;
+  int const first_row = row_group * row_span;
+  int const row_stride = row_group_count * row_span;
+  for (int row_block = first_row; row_block < row_count; row_block += row_stride) {
+    int const row_block_end = min(row_count, row_block + row_span);
+    for (int tile_row = row_block; tile_row < row_block_end; tile_row += 16) {
+      int const valid_rows = min(16, row_count - tile_row);
+      int64_t const row = static_cast<int64_t>(row_start) + tile_row;
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
+      if (do_mma) {
+        bool const direct_full_rank_tile = full_rank && valid_rows == 16;
+        if (direct_full_rank_tile) {
+          wmma::load_matrix_sync(a_frag, low_rank_workspace + row * 16, 16);
         } else {
-          out_pairs[local_pair] = __floats2bfloat162_rn(0.0f, 0.0f);
+          for (int idx = threadIdx.x; idx < 16 * 16; idx += blockDim.x) {
+            int const local_row = idx >> 4;
+            int const rank = idx & 15;
+            bool const valid_row = local_row < valid_rows;
+            if (has_lora && full_rank) {
+              a_smem[idx] = valid_row ? low_rank_workspace[(row + local_row) * 16 + rank]
+                                      : __float2bfloat16(0.0f);
+            } else {
+              a_smem[idx] = (valid_row && rank < lora_rank)
+                                ? low_rank_workspace[(row + local_row) * 16 + rank]
+                                : __float2bfloat16(0.0f);
+            }
+          }
+          __syncthreads();
+          wmma::load_matrix_sync(a_frag, a_smem, 16);
         }
       }
-      __syncwarp();
+
+#pragma unroll
+      for (int tile_offset = 0; tile_offset < kNTilesPerWarp; ++tile_offset) {
+        int const n_tile = n_tile_base + tile_offset;
+        bool const valid_n_tile = valid_n_tiles[tile_offset];
+        bool const has_valid_lora_tile = has_valid_lora_tiles[tile_offset];
+        if (has_valid_lora_tile) {
+          wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+          wmma::fill_fragment(c_frag, 0.0f);
+          wmma::mma_sync(c_frag, a_frag, b_frags[tile_offset], c_frag);
+          wmma::store_matrix_sync(c_smem[warp_id], c_frag, 16, wmma::mem_row_major);
+        }
+        __syncwarp();
+        if (!valid_n_tile) {
+          continue;
+        }
+        for (int idx = lane; idx < valid_rows * 8; idx += 32) {
+          int const local_row = idx >> 3;
+          int const local_pair = idx & 7;
+          int const c_offset = local_row * 16 + local_pair * 2;
+          auto* out_pairs = reinterpret_cast<__nv_bfloat162*>(
+              output + (row + local_row) * output_stride + static_cast<int64_t>(n_tile) * 16);
+          if (has_valid_lora_tile) {
+            float value0 = c_smem[warp_id][c_offset];
+            float value1 = c_smem[warp_id][c_offset + 1];
+            if constexpr (AddToOutput) {
+              float2 prev = __bfloat1622float2(out_pairs[local_pair]);
+              value0 += prev.x;
+              value1 += prev.y;
+            }
+            out_pairs[local_pair] = __floats2bfloat162_rn(value0, value1);
+          } else {
+            out_pairs[local_pair] = __floats2bfloat162_rn(0.0f, 0.0f);
+          }
+        }
+        __syncwarp();
+      }
     }
   }
 #endif
@@ -5600,7 +5639,8 @@ inline void launchLoraOutput16Bf16TensorCoreGrouped(
     int64_t output_stride, int num_lora_adapters, int num_experts_per_node,
     int32_t const* adapter_lora_ranks, void const* const* adapter_lora_weight_ptrs,
     int32_t const* adapter_expert_row_counts, int32_t const* adapter_expert_row_starts,
-    cudaStream_t stream, int output_split_count = 1, int output_split_index = 0) {
+    cudaStream_t stream, int output_split_count = 1, int output_split_index = 0,
+    int row_split_groups = 1, int row_split_rows = 0) {
   constexpr int threads = 32 * kWarpsPerBlock;
   int const out_tiles = static_cast<int>(out_hidden_size >> 4);
   int const split_count = std::max(1, output_split_count);
@@ -5615,14 +5655,17 @@ inline void launchLoraOutput16Bf16TensorCoreGrouped(
   int const n_tile_groups =
       static_cast<int>(((n_tile_end - n_tile_start) + kWarpsPerBlock * kNTilesPerWarp - 1) /
                        (kWarpsPerBlock * kNTilesPerWarp));
-  dim3 const grid(static_cast<unsigned int>(n_tile_groups),
+  int const safe_row_split_groups = std::max(1, std::min(row_split_groups, 64));
+  int const safe_row_split_rows = std::max(0, row_split_rows);
+  dim3 const grid(static_cast<unsigned int>(n_tile_groups * safe_row_split_groups),
                   static_cast<unsigned int>(num_lora_adapters),
                   static_cast<unsigned int>(num_experts_per_node));
   loraOutput16Bf16TensorCoreGroupedKernel<AddToOutput, kWarpsPerBlock, kNTilesPerWarp>
       <<<grid, threads, 0, stream>>>(output, low_rank_workspace, out_hidden_size, output_stride,
                                      num_lora_adapters, num_experts_per_node, adapter_lora_ranks,
                                      adapter_lora_weight_ptrs, adapter_expert_row_counts,
-                                     adapter_expert_row_starts, n_tile_start, n_tile_end);
+                                     adapter_expert_row_starts, n_tile_start, n_tile_end,
+                                     safe_row_split_groups, safe_row_split_rows);
 }
 
 template <bool AddToOutput>
@@ -5635,11 +5678,64 @@ inline void loraOutput16Bf16TensorCoreGrouped(
     int output_split_index = 0) {
   if (out_hidden_size == 6144 && output_stride == 6144 && expanded_num_rows >= 262144 &&
       num_experts_per_node == 256) {
-    launchLoraOutput16Bf16TensorCoreGrouped<AddToOutput, 4, 6>(
-        output, low_rank_workspace, out_hidden_size, output_stride, num_lora_adapters,
-        num_experts_per_node, adapter_lora_ranks, adapter_lora_weight_ptrs,
-        adapter_expert_row_counts, adapter_expert_row_starts, stream, output_split_count,
-        output_split_index);
+    int row_split_groups = 1;
+    int row_split_rows = 0;
+    if (char const* raw = std::getenv("FLASHINFER_CUTLASS_MOE_LORA_OUTPUT_ROW_SPLIT_GROUPS")) {
+      row_split_groups = std::max(1, std::atoi(raw));
+    }
+    if (char const* raw = std::getenv("FLASHINFER_CUTLASS_MOE_LORA_OUTPUT_ROW_SPLIT_ROWS")) {
+      row_split_rows = std::max(0, std::atoi(raw));
+    }
+    if (row_split_groups > 1 && row_split_rows == 0) {
+      row_split_rows = 128;
+    }
+    char const* raw_tile_shape = std::getenv("FLASHINFER_CUTLASS_MOE_LORA_OUTPUT_TILE");
+    if (raw_tile_shape == nullptr) {
+      raw_tile_shape = "8x2";
+    }
+    if (std::strcmp(raw_tile_shape, "2x4") == 0) {
+      launchLoraOutput16Bf16TensorCoreGrouped<AddToOutput, 2, 4>(
+          output, low_rank_workspace, out_hidden_size, output_stride, num_lora_adapters,
+          num_experts_per_node, adapter_lora_ranks, adapter_lora_weight_ptrs,
+          adapter_expert_row_counts, adapter_expert_row_starts, stream, output_split_count,
+          output_split_index, row_split_groups, row_split_rows);
+    } else if (std::strcmp(raw_tile_shape, "4x4") == 0) {
+      launchLoraOutput16Bf16TensorCoreGrouped<AddToOutput, 4, 4>(
+          output, low_rank_workspace, out_hidden_size, output_stride, num_lora_adapters,
+          num_experts_per_node, adapter_lora_ranks, adapter_lora_weight_ptrs,
+          adapter_expert_row_counts, adapter_expert_row_starts, stream, output_split_count,
+          output_split_index, row_split_groups, row_split_rows);
+    } else if (std::strcmp(raw_tile_shape, "4x6") == 0) {
+      launchLoraOutput16Bf16TensorCoreGrouped<AddToOutput, 4, 6>(
+          output, low_rank_workspace, out_hidden_size, output_stride, num_lora_adapters,
+          num_experts_per_node, adapter_lora_ranks, adapter_lora_weight_ptrs,
+          adapter_expert_row_counts, adapter_expert_row_starts, stream, output_split_count,
+          output_split_index, row_split_groups, row_split_rows);
+    } else if (std::strcmp(raw_tile_shape, "4x8") == 0) {
+      launchLoraOutput16Bf16TensorCoreGrouped<AddToOutput, 4, 8>(
+          output, low_rank_workspace, out_hidden_size, output_stride, num_lora_adapters,
+          num_experts_per_node, adapter_lora_ranks, adapter_lora_weight_ptrs,
+          adapter_expert_row_counts, adapter_expert_row_starts, stream, output_split_count,
+          output_split_index, row_split_groups, row_split_rows);
+    } else if (std::strcmp(raw_tile_shape, "8x2") == 0) {
+      launchLoraOutput16Bf16TensorCoreGrouped<AddToOutput, 8, 2>(
+          output, low_rank_workspace, out_hidden_size, output_stride, num_lora_adapters,
+          num_experts_per_node, adapter_lora_ranks, adapter_lora_weight_ptrs,
+          adapter_expert_row_counts, adapter_expert_row_starts, stream, output_split_count,
+          output_split_index, row_split_groups, row_split_rows);
+    } else if (std::strcmp(raw_tile_shape, "8x4") == 0) {
+      launchLoraOutput16Bf16TensorCoreGrouped<AddToOutput, 8, 4>(
+          output, low_rank_workspace, out_hidden_size, output_stride, num_lora_adapters,
+          num_experts_per_node, adapter_lora_ranks, adapter_lora_weight_ptrs,
+          adapter_expert_row_counts, adapter_expert_row_starts, stream, output_split_count,
+          output_split_index, row_split_groups, row_split_rows);
+    } else {
+      launchLoraOutput16Bf16TensorCoreGrouped<AddToOutput, 6, 4>(
+          output, low_rank_workspace, out_hidden_size, output_stride, num_lora_adapters,
+          num_experts_per_node, adapter_lora_ranks, adapter_lora_weight_ptrs,
+          adapter_expert_row_counts, adapter_expert_row_starts, stream, output_split_count,
+          output_split_index, row_split_groups, row_split_rows);
+    }
     return;
   }
   launchLoraOutput16Bf16TensorCoreGrouped<AddToOutput, 4, 4>(
@@ -5648,6 +5744,7 @@ inline void loraOutput16Bf16TensorCoreGrouped(
       adapter_expert_row_starts, stream, output_split_count, output_split_index);
 }
 
+template <int kWarpsPerBlock, int kNTilesPerWarp>
 __global__ void loraOutput16Bf16TensorCoreGroupedDualKernel(
     __nv_bfloat16* output0, __nv_bfloat16* output1, __nv_bfloat16 const* low_rank_workspace0,
     __nv_bfloat16 const* low_rank_workspace1, int64_t out_hidden_size, int64_t output_stride,
@@ -5655,14 +5752,17 @@ __global__ void loraOutput16Bf16TensorCoreGroupedDualKernel(
     void const* const* adapter_lora_weight_ptrs0, int32_t const* adapter_lora_ranks1,
     void const* const* adapter_lora_weight_ptrs1, int32_t const* adapter_expert_row_counts,
     int32_t const* adapter_expert_row_starts, int32_t const* no_adapter_expert_row_counts,
-    int32_t const* no_adapter_expert_row_starts, bool zero_no_adapter_rows) {
+    int32_t const* no_adapter_expert_row_starts, bool zero_no_adapter_rows,
+    int row_split_groups, int row_split_rows) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
-  constexpr int kWarpsPerBlock = 4;
-  constexpr int kNTilesPerWarp = 8;
   int const warp_id = threadIdx.x >> 5;
   int const lane = threadIdx.x & 31;
+  int const row_group_count = max(1, row_split_groups);
+  int const linear_tile_group = static_cast<int>(blockIdx.x);
+  int const n_tile_group = linear_tile_group / row_group_count;
+  int const row_group = linear_tile_group - n_tile_group * row_group_count;
   int const n_tile_base =
-      (static_cast<int>(blockIdx.x) * kWarpsPerBlock + warp_id) * kNTilesPerWarp;
+      (n_tile_group * kWarpsPerBlock + warp_id) * kNTilesPerWarp;
   int const adapter = static_cast<int>(blockIdx.y);
   int const expert = static_cast<int>(blockIdx.z);
   int const out_tiles = static_cast<int>(out_hidden_size >> 4);
@@ -5727,24 +5827,32 @@ __global__ void loraOutput16Bf16TensorCoreGroupedDualKernel(
     int32_t const no_adapter_row_count = no_adapter_expert_row_counts[expert];
     int32_t const no_adapter_row_start = no_adapter_expert_row_starts[expert];
     if (no_adapter_row_count > 0 && no_adapter_row_start >= 0) {
-      for (int tile_row = 0; tile_row < no_adapter_row_count; tile_row += 16) {
-        int const valid_rows = min(16, no_adapter_row_count - tile_row);
-        int64_t const row = static_cast<int64_t>(no_adapter_row_start) + tile_row;
+      int const no_adapter_row_span =
+          row_split_rows > 0 ? row_split_rows : no_adapter_row_count;
+      int const no_adapter_first_row = row_group * no_adapter_row_span;
+      int const no_adapter_row_stride = row_group_count * no_adapter_row_span;
+      for (int row_block = no_adapter_first_row; row_block < no_adapter_row_count;
+           row_block += no_adapter_row_stride) {
+        int const row_block_end = min(no_adapter_row_count, row_block + no_adapter_row_span);
+        for (int tile_row = row_block; tile_row < row_block_end; tile_row += 16) {
+          int const valid_rows = min(16, row_block_end - tile_row);
+          int64_t const row = static_cast<int64_t>(no_adapter_row_start) + tile_row;
 #pragma unroll
-        for (int tile_offset = 0; tile_offset < kNTilesPerWarp; ++tile_offset) {
-          int const n_tile = n_tile_base + tile_offset;
-          if (!valid_n_tiles[tile_offset]) {
-            continue;
-          }
-          for (int idx = lane; idx < valid_rows * 8; idx += 32) {
-            int const local_row = idx >> 3;
-            int const local_pair = idx & 7;
-            auto* out0_pairs = reinterpret_cast<__nv_bfloat162*>(
-                output0 + (row + local_row) * output_stride + static_cast<int64_t>(n_tile) * 16);
-            auto* out1_pairs = reinterpret_cast<__nv_bfloat162*>(
-                output1 + (row + local_row) * output_stride + static_cast<int64_t>(n_tile) * 16);
-            out0_pairs[local_pair] = __floats2bfloat162_rn(0.0f, 0.0f);
-            out1_pairs[local_pair] = __floats2bfloat162_rn(0.0f, 0.0f);
+          for (int tile_offset = 0; tile_offset < kNTilesPerWarp; ++tile_offset) {
+            int const n_tile = n_tile_base + tile_offset;
+            if (!valid_n_tiles[tile_offset]) {
+              continue;
+            }
+            for (int idx = lane; idx < valid_rows * 8; idx += 32) {
+              int const local_row = idx >> 3;
+              int const local_pair = idx & 7;
+              auto* out0_pairs = reinterpret_cast<__nv_bfloat162*>(
+                  output0 + (row + local_row) * output_stride + static_cast<int64_t>(n_tile) * 16);
+              auto* out1_pairs = reinterpret_cast<__nv_bfloat162*>(
+                  output1 + (row + local_row) * output_stride + static_cast<int64_t>(n_tile) * 16);
+              out0_pairs[local_pair] = __floats2bfloat162_rn(0.0f, 0.0f);
+              out1_pairs[local_pair] = __floats2bfloat162_rn(0.0f, 0.0f);
+            }
           }
         }
       }
@@ -5755,102 +5863,112 @@ __global__ void loraOutput16Bf16TensorCoreGroupedDualKernel(
     return;
   }
 
-  for (int tile_row = 0; tile_row < row_count; tile_row += 16) {
-    int const valid_rows = min(16, row_count - tile_row);
-    int64_t const row = static_cast<int64_t>(row_start) + tile_row;
-    for (int idx = threadIdx.x; idx < 16 * 16; idx += blockDim.x) {
-      int const local_row = idx >> 4;
-      int const rank = idx & 15;
-      bool const valid_row = local_row < valid_rows;
-      a_smem0[idx] = (valid_row && has_lora0 && (full_rank0 || rank < lora_rank0))
-                         ? low_rank_workspace0[(row + local_row) * 16 + rank]
-                         : __float2bfloat16(0.0f);
-      a_smem1[idx] = (valid_row && has_lora1 && (full_rank1 || rank < lora_rank1))
-                         ? low_rank_workspace1[(row + local_row) * 16 + rank]
-                         : __float2bfloat16(0.0f);
-    }
-    __syncthreads();
+  int const row_span = row_split_rows > 0 ? row_split_rows : row_count;
+  int const first_row = row_group * row_span;
+  int const row_stride = row_group_count * row_span;
+  for (int row_block = first_row; row_block < row_count; row_block += row_stride) {
+    int const row_block_end = min(row_count, row_block + row_span);
+    for (int tile_row = row_block; tile_row < row_block_end; tile_row += 16) {
+      int const valid_rows = min(16, row_block_end - tile_row);
+      int64_t const row = static_cast<int64_t>(row_start) + tile_row;
+      for (int idx = threadIdx.x; idx < 16 * 16; idx += blockDim.x) {
+        int const local_row = idx >> 4;
+        int const rank = idx & 15;
+        bool const valid_row = local_row < valid_rows;
+        a_smem0[idx] = (valid_row && has_lora0 && (full_rank0 || rank < lora_rank0))
+                           ? low_rank_workspace0[(row + local_row) * 16 + rank]
+                           : __float2bfloat16(0.0f);
+        a_smem1[idx] = (valid_row && has_lora1 && (full_rank1 || rank < lora_rank1))
+                           ? low_rank_workspace1[(row + local_row) * 16 + rank]
+                           : __float2bfloat16(0.0f);
+      }
+      __syncthreads();
 
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag0;
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag1;
-    if (do_mma0) {
-      wmma::load_matrix_sync(a_frag0, a_smem0, 16);
-    }
-    if (do_mma1) {
-      wmma::load_matrix_sync(a_frag1, a_smem1, 16);
-    }
-    __syncthreads();
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag0;
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag1;
+      if (do_mma0) {
+        wmma::load_matrix_sync(a_frag0, a_smem0, 16);
+      }
+      if (do_mma1) {
+        wmma::load_matrix_sync(a_frag1, a_smem1, 16);
+      }
+      __syncthreads();
 
-    if (do_mma0) {
+      if (do_mma0) {
+#pragma unroll
+        for (int tile_offset = 0; tile_offset < kNTilesPerWarp; ++tile_offset) {
+          if (!has_valid_lora0_tiles[tile_offset]) {
+            continue;
+          }
+          wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+          wmma::fill_fragment(c_frag, 0.0f);
+          wmma::mma_sync(c_frag, a_frag0, b_frags0[tile_offset], c_frag);
+          wmma::store_matrix_sync(c_smem[warp_id][tile_offset], c_frag, 16,
+                                  wmma::mem_row_major);
+        }
+      }
+      __syncwarp();
+
 #pragma unroll
       for (int tile_offset = 0; tile_offset < kNTilesPerWarp; ++tile_offset) {
-        if (!has_valid_lora0_tiles[tile_offset]) {
+        int const n_tile = n_tile_base + tile_offset;
+        bool const valid_n_tile = valid_n_tiles[tile_offset];
+        if (!valid_n_tile) {
           continue;
         }
-        wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
-        wmma::fill_fragment(c_frag, 0.0f);
-        wmma::mma_sync(c_frag, a_frag0, b_frags0[tile_offset], c_frag);
-        wmma::store_matrix_sync(c_smem[warp_id][tile_offset], c_frag, 16, wmma::mem_row_major);
-      }
-    }
-    __syncwarp();
-
-#pragma unroll
-    for (int tile_offset = 0; tile_offset < kNTilesPerWarp; ++tile_offset) {
-      int const n_tile = n_tile_base + tile_offset;
-      bool const valid_n_tile = valid_n_tiles[tile_offset];
-      if (!valid_n_tile) {
-        continue;
-      }
-      bool const has_valid_lora0 = has_valid_lora0_tiles[tile_offset];
-      for (int idx = lane; idx < valid_rows * 8; idx += 32) {
-        int const local_row = idx >> 3;
-        int const local_pair = idx & 7;
-        int const c_offset = local_row * 16 + local_pair * 2;
-        auto* out0_pairs = reinterpret_cast<__nv_bfloat162*>(
-            output0 + (row + local_row) * output_stride + static_cast<int64_t>(n_tile) * 16);
-        if (has_valid_lora0) {
-          out0_pairs[local_pair] = __floats2bfloat162_rn(
-              c_smem[warp_id][tile_offset][c_offset], c_smem[warp_id][tile_offset][c_offset + 1]);
-        } else {
-          out0_pairs[local_pair] = __floats2bfloat162_rn(0.0f, 0.0f);
+        bool const has_valid_lora0 = has_valid_lora0_tiles[tile_offset];
+        for (int idx = lane; idx < valid_rows * 8; idx += 32) {
+          int const local_row = idx >> 3;
+          int const local_pair = idx & 7;
+          int const c_offset = local_row * 16 + local_pair * 2;
+          auto* out0_pairs = reinterpret_cast<__nv_bfloat162*>(
+              output0 + (row + local_row) * output_stride + static_cast<int64_t>(n_tile) * 16);
+          if (has_valid_lora0) {
+            out0_pairs[local_pair] = __floats2bfloat162_rn(
+                c_smem[warp_id][tile_offset][c_offset],
+                c_smem[warp_id][tile_offset][c_offset + 1]);
+          } else {
+            out0_pairs[local_pair] = __floats2bfloat162_rn(0.0f, 0.0f);
+          }
         }
       }
-    }
 
-    if (do_mma1) {
+      if (do_mma1) {
+#pragma unroll
+        for (int tile_offset = 0; tile_offset < kNTilesPerWarp; ++tile_offset) {
+          if (!has_valid_lora1_tiles[tile_offset]) {
+            continue;
+          }
+          wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+          wmma::fill_fragment(c_frag, 0.0f);
+          wmma::mma_sync(c_frag, a_frag1, b_frags1[tile_offset], c_frag);
+          wmma::store_matrix_sync(c_smem[warp_id][tile_offset], c_frag, 16,
+                                  wmma::mem_row_major);
+        }
+      }
+      __syncwarp();
+
 #pragma unroll
       for (int tile_offset = 0; tile_offset < kNTilesPerWarp; ++tile_offset) {
-        if (!has_valid_lora1_tiles[tile_offset]) {
+        int const n_tile = n_tile_base + tile_offset;
+        bool const valid_n_tile = valid_n_tiles[tile_offset];
+        if (!valid_n_tile) {
           continue;
         }
-        wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
-        wmma::fill_fragment(c_frag, 0.0f);
-        wmma::mma_sync(c_frag, a_frag1, b_frags1[tile_offset], c_frag);
-        wmma::store_matrix_sync(c_smem[warp_id][tile_offset], c_frag, 16, wmma::mem_row_major);
-      }
-    }
-    __syncwarp();
-
-#pragma unroll
-    for (int tile_offset = 0; tile_offset < kNTilesPerWarp; ++tile_offset) {
-      int const n_tile = n_tile_base + tile_offset;
-      bool const valid_n_tile = valid_n_tiles[tile_offset];
-      if (!valid_n_tile) {
-        continue;
-      }
-      bool const has_valid_lora1 = has_valid_lora1_tiles[tile_offset];
-      for (int idx = lane; idx < valid_rows * 8; idx += 32) {
-        int const local_row = idx >> 3;
-        int const local_pair = idx & 7;
-        int const c_offset = local_row * 16 + local_pair * 2;
-        auto* out1_pairs = reinterpret_cast<__nv_bfloat162*>(
-            output1 + (row + local_row) * output_stride + static_cast<int64_t>(n_tile) * 16);
-        if (has_valid_lora1) {
-          out1_pairs[local_pair] = __floats2bfloat162_rn(
-              c_smem[warp_id][tile_offset][c_offset], c_smem[warp_id][tile_offset][c_offset + 1]);
-        } else {
-          out1_pairs[local_pair] = __floats2bfloat162_rn(0.0f, 0.0f);
+        bool const has_valid_lora1 = has_valid_lora1_tiles[tile_offset];
+        for (int idx = lane; idx < valid_rows * 8; idx += 32) {
+          int const local_row = idx >> 3;
+          int const local_pair = idx & 7;
+          int const c_offset = local_row * 16 + local_pair * 2;
+          auto* out1_pairs = reinterpret_cast<__nv_bfloat162*>(
+              output1 + (row + local_row) * output_stride + static_cast<int64_t>(n_tile) * 16);
+          if (has_valid_lora1) {
+            out1_pairs[local_pair] = __floats2bfloat162_rn(
+                c_smem[warp_id][tile_offset][c_offset],
+                c_smem[warp_id][tile_offset][c_offset + 1]);
+          } else {
+            out1_pairs[local_pair] = __floats2bfloat162_rn(0.0f, 0.0f);
+          }
         }
       }
     }
@@ -5858,30 +5976,99 @@ __global__ void loraOutput16Bf16TensorCoreGroupedDualKernel(
 #endif
 }
 
-inline void loraOutput16Bf16TensorCoreGroupedDual(
+template <int kWarpsPerBlock, int kNTilesPerWarp>
+inline void launchLoraOutput16Bf16TensorCoreGroupedDual(
     __nv_bfloat16* output0, __nv_bfloat16* output1, __nv_bfloat16 const* low_rank_workspace0,
     __nv_bfloat16 const* low_rank_workspace1, int64_t out_hidden_size, int64_t output_stride,
     int num_lora_adapters, int num_experts_per_node, int32_t const* adapter_lora_ranks0,
     void const* const* adapter_lora_weight_ptrs0, int32_t const* adapter_lora_ranks1,
     void const* const* adapter_lora_weight_ptrs1, int32_t const* adapter_expert_row_counts,
     int32_t const* adapter_expert_row_starts, int32_t const* no_adapter_expert_row_counts,
-    int32_t const* no_adapter_expert_row_starts, cudaStream_t stream,
-    bool zero_no_adapter_rows = true) {
-  constexpr int threads = 128;
-  constexpr int warps_per_block = 4;
-  constexpr int n_tiles_per_warp = 8;
+    int32_t const* no_adapter_expert_row_starts, cudaStream_t stream, bool zero_no_adapter_rows,
+    int row_split_groups, int row_split_rows) {
+  constexpr int threads = 32 * kWarpsPerBlock;
   int const n_tile_groups =
-      static_cast<int>(((out_hidden_size >> 4) + warps_per_block * n_tiles_per_warp - 1) /
-                       (warps_per_block * n_tiles_per_warp));
-  dim3 const grid(static_cast<unsigned int>(n_tile_groups),
+      static_cast<int>(((out_hidden_size >> 4) + kWarpsPerBlock * kNTilesPerWarp - 1) /
+                       (kWarpsPerBlock * kNTilesPerWarp));
+  dim3 const grid(static_cast<unsigned int>(n_tile_groups * row_split_groups),
                   static_cast<unsigned int>(num_lora_adapters),
                   static_cast<unsigned int>(num_experts_per_node));
-  loraOutput16Bf16TensorCoreGroupedDualKernel<<<grid, threads, 0, stream>>>(
+  loraOutput16Bf16TensorCoreGroupedDualKernel<kWarpsPerBlock, kNTilesPerWarp>
+      <<<grid, threads, 0, stream>>>(
+          output0, output1, low_rank_workspace0, low_rank_workspace1, out_hidden_size,
+          output_stride, num_lora_adapters, num_experts_per_node, adapter_lora_ranks0,
+          adapter_lora_weight_ptrs0, adapter_lora_ranks1, adapter_lora_weight_ptrs1,
+          adapter_expert_row_counts, adapter_expert_row_starts, no_adapter_expert_row_counts,
+          no_adapter_expert_row_starts, zero_no_adapter_rows, row_split_groups, row_split_rows);
+}
+
+inline void loraOutput16Bf16TensorCoreGroupedDual(
+    __nv_bfloat16* output0, __nv_bfloat16* output1, __nv_bfloat16 const* low_rank_workspace0,
+    __nv_bfloat16 const* low_rank_workspace1, int64_t out_hidden_size, int64_t output_stride,
+    int64_t expanded_num_rows, int num_lora_adapters, int num_experts_per_node,
+    int32_t const* adapter_lora_ranks0, void const* const* adapter_lora_weight_ptrs0,
+    int32_t const* adapter_lora_ranks1, void const* const* adapter_lora_weight_ptrs1,
+    int32_t const* adapter_expert_row_counts, int32_t const* adapter_expert_row_starts,
+    int32_t const* no_adapter_expert_row_counts, int32_t const* no_adapter_expert_row_starts,
+    cudaStream_t stream, bool zero_no_adapter_rows = true) {
+  bool const use_glm_32k_default_split =
+      out_hidden_size == 2048 && output_stride == 4096 && expanded_num_rows >= 262144 &&
+      num_experts_per_node == 256;
+  int row_split_groups = use_glm_32k_default_split ? 4 : 1;
+  int row_split_rows = use_glm_32k_default_split ? 128 : 0;
+  if (out_hidden_size == 2048 && output_stride == 4096 && num_experts_per_node == 256) {
+    if (char const* env = std::getenv("FLASHINFER_CUTLASS_MOE_LORA_DUAL_OUTPUT_ROW_SPLIT_GROUPS")) {
+      row_split_groups = std::atoi(env);
+    }
+    if (char const* env = std::getenv("FLASHINFER_CUTLASS_MOE_LORA_DUAL_OUTPUT_ROW_SPLIT_ROWS")) {
+      row_split_rows = std::atoi(env);
+    }
+    if (row_split_groups > 1 && row_split_rows <= 0) {
+      row_split_rows = 128;
+    }
+  }
+  row_split_groups = std::max(1, std::min(row_split_groups, 64));
+  row_split_rows = std::max(0, row_split_rows);
+
+  char const* raw_tile_shape = std::getenv("FLASHINFER_CUTLASS_MOE_LORA_DUAL_OUTPUT_TILE");
+  if (raw_tile_shape != nullptr) {
+    if (std::strcmp(raw_tile_shape, "8x2") == 0) {
+      launchLoraOutput16Bf16TensorCoreGroupedDual<8, 2>(
+          output0, output1, low_rank_workspace0, low_rank_workspace1, out_hidden_size,
+          output_stride, num_lora_adapters, num_experts_per_node, adapter_lora_ranks0,
+          adapter_lora_weight_ptrs0, adapter_lora_ranks1, adapter_lora_weight_ptrs1,
+          adapter_expert_row_counts, adapter_expert_row_starts, no_adapter_expert_row_counts,
+          no_adapter_expert_row_starts, stream, zero_no_adapter_rows, row_split_groups,
+          row_split_rows);
+      return;
+    }
+    if (std::strcmp(raw_tile_shape, "8x4") == 0) {
+      launchLoraOutput16Bf16TensorCoreGroupedDual<8, 4>(
+          output0, output1, low_rank_workspace0, low_rank_workspace1, out_hidden_size,
+          output_stride, num_lora_adapters, num_experts_per_node, adapter_lora_ranks0,
+          adapter_lora_weight_ptrs0, adapter_lora_ranks1, adapter_lora_weight_ptrs1,
+          adapter_expert_row_counts, adapter_expert_row_starts, no_adapter_expert_row_counts,
+          no_adapter_expert_row_starts, stream, zero_no_adapter_rows, row_split_groups,
+          row_split_rows);
+      return;
+    }
+    if (std::strcmp(raw_tile_shape, "4x4") == 0) {
+      launchLoraOutput16Bf16TensorCoreGroupedDual<4, 4>(
+          output0, output1, low_rank_workspace0, low_rank_workspace1, out_hidden_size,
+          output_stride, num_lora_adapters, num_experts_per_node, adapter_lora_ranks0,
+          adapter_lora_weight_ptrs0, adapter_lora_ranks1, adapter_lora_weight_ptrs1,
+          adapter_expert_row_counts, adapter_expert_row_starts, no_adapter_expert_row_counts,
+          no_adapter_expert_row_starts, stream, zero_no_adapter_rows, row_split_groups,
+          row_split_rows);
+      return;
+    }
+  }
+  launchLoraOutput16Bf16TensorCoreGroupedDual<4, 8>(
       output0, output1, low_rank_workspace0, low_rank_workspace1, out_hidden_size, output_stride,
       num_lora_adapters, num_experts_per_node, adapter_lora_ranks0, adapter_lora_weight_ptrs0,
       adapter_lora_ranks1, adapter_lora_weight_ptrs1, adapter_expert_row_counts,
       adapter_expert_row_starts, no_adapter_expert_row_counts, no_adapter_expert_row_starts,
-      zero_no_adapter_rows);
+      stream, zero_no_adapter_rows, row_split_groups, row_split_rows);
 }
 
 __global__ void zeroNoAdapterGatedLoraOutputBf16Kernel(__nv_bfloat16* output, int64_t inter_size,
@@ -6765,6 +6952,7 @@ auto CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
               static_cast<__nv_bfloat16*>(lora_add_bias_),
               static_cast<__nv_bfloat16*>(lora_add_bias_ + inter_size), low_rank_workspace,
               low_rank_workspace + expanded_num_rows * 16, inter_size, inter_size * 2,
+              expanded_num_rows,
               lora_params.num_lora_adapters, num_experts_per_node, lora_params.gated_lora_ranks,
               lora_params.gated_lora_weight_ptrs, lora_params.fc1_lora_ranks,
               lora_params.fc1_lora_weight_ptrs, lora_params.adapter_expert_row_counts,
@@ -7305,13 +7493,13 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
     bool overlap_fc1_lora_with_gemm1 = false;
     if constexpr (std::is_same_v<T, __nv_bfloat16> && std::is_same_v<InputType, __nv_bfloat16> &&
                   std::is_same_v<ScaleBiasType, __nv_bfloat16>) {
-      overlap_fc1_lora_with_gemm1 =
-          use_lora && is_gated_activation && fc1_expert_biases == nullptr &&
-          lora_params.max_low_rank == 16 && expanded_num_rows >= 1024 &&
-          lora_params.rows_grouped_by_adapter && !use_deepseek_fp8_block_scale && !use_awq &&
-          !use_w4_groupwise && gemm1_config_->swap_ab &&
-          moe_gemm_runner_.isTmaWarpSpecialized(*gemm1_config_);
-    }
+		      overlap_fc1_lora_with_gemm1 =
+		          use_lora && is_gated_activation && fc1_expert_biases == nullptr &&
+	          lora_params.max_low_rank == 16 && expanded_num_rows >= 1024 &&
+	          lora_params.rows_grouped_by_adapter && !use_deepseek_fp8_block_scale && !use_awq &&
+	          !use_w4_groupwise && gemm1_config_->swap_ab &&
+	          moe_gemm_runner_.isTmaWarpSpecialized(*gemm1_config_);
+	    }
 
     // Only NVFP4xNVFP4 supports FC1 per-expert act scale
     bool use_per_expert_act_scale = use_fp4 ? quant_params.fp4.fc1.use_per_expert_act_scale : false;
@@ -7341,9 +7529,9 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
 
       if (!all_token_without_lora) {
         if (overlap_fc1_lora_with_gemm1) {
-          check_cuda_error(cudaEventRecord(lora_start_event_, stream));
           auto const* fc1_lora_base_biases = fc1_expert_biases;
           fc1_expert_biases = lora_add_bias_;
+          check_cuda_error(cudaEventRecord(lora_start_event_, stream));
           deferred_fc1_lora_work = [&, fc1_lora_base_biases]() {
             check_cuda_error(cudaStreamWaitEvent(lora_stream_, lora_start_event_, 0));
             (void)loraFC1(expanded_num_rows, inter_size, hidden_size, num_experts_per_node,
@@ -7481,11 +7669,11 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
                                        lora_params.fc2_lora_weight_ptrs != nullptr &&
                                        lora_params.num_lora_adapters > 0 && experts_per_token <= 16;
             if (used_token_lora_finalize) {
-              if (overlap_fc2_lora_with_gemm2 && !waited_for_fc2_lora) {
-                check_cuda_error(cudaStreamWaitEvent(stream, lora_fc2_ready_event_, 0));
-                waited_for_fc2_lora = true;
-              }
               if (lora_params.token_lora_indices_is_int64) {
+                if (overlap_fc2_lora_with_gemm2 && !waited_for_fc2_lora) {
+                  check_cuda_error(cudaStreamWaitEvent(stream, lora_fc2_ready_event_, 0));
+                  waited_for_fc2_lora = true;
+                }
                 finalizeMoeRoutingWithTokenLoraKernelLauncher<OutputType, UnfusedGemmOutputType,
                                                               ScaleBiasType, int64_t>(
                     static_cast<UnfusedGemmOutputType const*>(fc2_result_),
@@ -7497,6 +7685,10 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
                     hidden_size, unpadded_hidden_size, experts_per_token, num_experts_per_node,
                     parallelism_config, lora_params.num_lora_adapters, enable_pdl, stream);
               } else {
+                if (overlap_fc2_lora_with_gemm2 && !waited_for_fc2_lora) {
+                  check_cuda_error(cudaStreamWaitEvent(stream, lora_fc2_ready_event_, 0));
+                  waited_for_fc2_lora = true;
+                }
                 finalizeMoeRoutingWithTokenLoraKernelLauncher<OutputType, UnfusedGemmOutputType,
                                                               ScaleBiasType, int32_t>(
                     static_cast<UnfusedGemmOutputType const*>(fc2_result_),

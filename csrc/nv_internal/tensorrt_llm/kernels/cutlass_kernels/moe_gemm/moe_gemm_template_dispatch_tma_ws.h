@@ -67,9 +67,10 @@ using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
 
 namespace {
 
-inline bool shouldUseSm90Bf16Pingpong(cutlass_extensions::CutlassGemmConfig const& gemm_config) {
+inline bool shouldUseSm90Bf16Pingpong(cutlass_extensions::CutlassGemmConfig const& gemm_config,
+                                      int physical_sm_count) {
   char const* value = std::getenv("FLASHINFER_CUTLASS_MOE_SM90_BF16_PINGPONG");
-  if (value == nullptr || *value == '\0' || *value == '0') {
+  if (value != nullptr && *value == '0') {
     return false;
   }
   if (gemm_config.sm_version != 90 ||
@@ -89,7 +90,15 @@ inline bool shouldUseSm90Bf16Pingpong(cutlass_extensions::CutlassGemmConfig cons
     return false;
   }
 
-  return true;
+  if (value != nullptr && *value != '\0') {
+    return true;
+  }
+
+  // H20-class SM90 parts use this path for the GLM-5.1 32K LoRA MoE static
+  // profile. Keeping the default in C++ avoids per-layer Python environment
+  // updates while preserving FLASHINFER_CUTLASS_MOE_SM90_BF16_PINGPONG=0 as an
+  // escape hatch.
+  return physical_sm_count <= 80;
 }
 
 }  // namespace
@@ -234,7 +243,7 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(
             std::is_same_v<T, __nv_bfloat16> && std::is_same_v<WeightType, __nv_bfloat16> &&
             std::is_same_v<OutputType, __nv_bfloat16>;
         if constexpr (can_use_sm90_bf16_pingpong) {
-          if (shouldUseSm90Bf16Pingpong(gemm_config)) {
+          if (shouldUseSm90Bf16Pingpong(gemm_config, multi_processor_count)) {
             using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong;
             constexpr bool dynamic_cga = false;
             auto selected_func =
@@ -459,7 +468,7 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(
     dispatchMoeGemmSelectClusterShapeTmaWarpSpecialized<cutlass::arch::Sm##SMVERSION, T,     \
                                                         WeightType, OutputType, EpilogueTag, \
                                                         FUSION, TileShape, IsMXFPX>(         \
-        hopper_input, num_experts, gemm_config, multi_processor_count, stream, occupancy,    \
+        hopper_input, num_experts, gemm_config, multi_processor_count, stream, occupancy,     \
         workspace_size);                                                                     \
     break;                                                                                   \
   }

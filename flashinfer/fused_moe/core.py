@@ -207,6 +207,36 @@ def _autotuner_is_tuning() -> bool:
     return tuner is not None and tuner.is_tuning_mode
 
 
+def _get_static_profile_ids_override() -> Optional[Tuple[int, int]]:
+    raw_profile_ids = os.environ.get("FLASHINFER_CUTLASS_MOE_STATIC_PROFILE_IDS")
+    if not raw_profile_ids:
+        raw_profile_ids = os.environ.get("FLASHINFER_CUTLASS_MOE_H20_GLM_PROFILE_IDS")
+    if not raw_profile_ids:
+        return None
+    parts = raw_profile_ids.replace(":", ",").split(",")
+    if len(parts) != 2:
+        raise ValueError(
+            "FLASHINFER_CUTLASS_MOE_STATIC_PROFILE_IDS or "
+            "FLASHINFER_CUTLASS_MOE_H20_GLM_PROFILE_IDS must be 'gemm1,gemm2'."
+        )
+    return int(parts[0]), int(parts[1])
+
+
+def _get_cutlass_moe_pdl_override() -> Optional[bool]:
+    raw_value = os.environ.get("FLASHINFER_CUTLASS_MOE_ENABLE_PDL")
+    if raw_value is None:
+        return None
+    normalized = raw_value.strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(
+        "FLASHINFER_CUTLASS_MOE_ENABLE_PDL must be a boolean value "
+        "like '0'/'1' or 'false'/'true'."
+    )
+
+
 def _get_h20_glm_bf16_moe_profile_ids(
     device_arch: str,
     input: torch.Tensor,
@@ -261,6 +291,10 @@ def _get_h20_glm_bf16_moe_profile_ids(
     if not _is_h20_device(input.device):
         return None
 
+    override_profile_ids = _get_static_profile_ids_override()
+    if override_profile_ids is not None:
+        return override_profile_ids
+
     # Kernel-level profile-pair sweep on H20-3e, GLM-5.1 BF16 MoE
     # E=256, H=6144, I=2048, top_k=8.
     num_rows = input.shape[0]
@@ -278,22 +312,8 @@ def _get_h20_glm_bf16_moe_profile_ids(
     if num_rows <= 1408:
         return (18, 84)
     if num_rows >= 32768:
-        return (22, 86)
+        return (22, 85)
     return (20, 83)
-
-
-def _h20_glm_bf16_lora_32k_tma_env_defaults(
-    static_profile_ids: Optional[Tuple[int, int]],
-) -> Dict[str, str]:
-    if static_profile_ids != (22, 86):
-        return {}
-
-    defaults: Dict[str, str] = {}
-    if "FLASHINFER_CUTLASS_MOE_SM90_BF16_PINGPONG" not in os.environ:
-        defaults["FLASHINFER_CUTLASS_MOE_SM90_BF16_PINGPONG"] = "all"
-    if "FLASHINFER_CUTLASS_MOE_TMA_GEMM2_SMS" not in os.environ:
-        defaults["FLASHINFER_CUTLASS_MOE_TMA_GEMM2_SMS"] = "74"
-    return defaults
 
 
 def get_reorder_rows_for_gated_act_gemm_row_indices(x) -> torch.Tensor:
@@ -613,6 +633,9 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 gated_lora_weight_ptrs,
             )
         )
+        pdl_override = _get_cutlass_moe_pdl_override()
+        if pdl_override is not None:
+            enable_pdl = pdl_override
         static_profile_ids = _get_h20_glm_bf16_moe_profile_ids(
             backend,
             input,
@@ -636,7 +659,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             use_packed_weights=use_packed_weights,
             use_lora=use_lora,
         )
-        if static_profile_ids == (22, 86):
+        if static_profile_ids in ((22, 85), (22, 86), (28, 86)) and pdl_override is not True:
             enable_pdl = False
 
         if static_profile_ids is not None and not _autotuner_is_tuning():
@@ -722,7 +745,6 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             if min_latency_mode
             else fused_moe_runner.run_moe
         )
-        tma_env_defaults = _h20_glm_bf16_lora_32k_tma_env_defaults(static_profile_ids)
         min_latency_output = []
         if min_latency_mode:
             num_active_experts_per_node = torch.empty(
@@ -743,51 +765,42 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 experts_to_token_score,
                 active_expert_global_ids,
             ]
-        old_env = {key: os.environ.get(key) for key in tma_env_defaults}
-        try:
-            os.environ.update(tma_env_defaults)
-            run_moe(
-                output,
-                input,
-                token_selected_experts,
-                token_final_scales,
-                fc1_expert_weights,
-                fc1_expert_biases,
-                fc2_expert_weights,
-                fc2_expert_biases,
-                quant_scales,
-                input_sf,
-                swiglu_alpha,
-                swiglu_beta,
-                swiglu_limit,
-                swizzled_input_sf,
-                *min_latency_output,
-                tp_size,
-                tp_rank,
-                ep_size,
-                ep_rank,
-                cluster_size,
-                cluster_rank,
-                enable_alltoall,
-                min_latency_mode,
-                [gemm_tactic_1, gemm_tactic_2],
-                enable_pdl,
-                token_lora_indices,
-                fc1_lora_ranks,
-                fc1_lora_weight_ptrs,
-                fc2_lora_ranks,
-                fc2_lora_weight_ptrs,
-                gated_lora_ranks,
-                gated_lora_weight_ptrs,
-                lora_max_rank,
-                activation_type,
-            )
-        finally:
-            for key, value in old_env.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
+        run_moe(
+            output,
+            input,
+            token_selected_experts,
+            token_final_scales,
+            fc1_expert_weights,
+            fc1_expert_biases,
+            fc2_expert_weights,
+            fc2_expert_biases,
+            quant_scales,
+            input_sf,
+            swiglu_alpha,
+            swiglu_beta,
+            swiglu_limit,
+            swizzled_input_sf,
+            *min_latency_output,
+            tp_size,
+            tp_rank,
+            ep_size,
+            ep_rank,
+            cluster_size,
+            cluster_rank,
+            enable_alltoall,
+            min_latency_mode,
+            [gemm_tactic_1, gemm_tactic_2],
+            enable_pdl,
+            token_lora_indices,
+            fc1_lora_ranks,
+            fc1_lora_weight_ptrs,
+            fc2_lora_ranks,
+            fc2_lora_weight_ptrs,
+            gated_lora_ranks,
+            gated_lora_weight_ptrs,
+            lora_max_rank,
+            activation_type,
+        )
 
         return output if min_latency_mode else [output]
 
